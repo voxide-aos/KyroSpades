@@ -550,10 +550,20 @@ static inline void hud_font_render_centered(float x, float y, float h, char* tex
 }
 
 static int chat_messages = 16;
+static int chat_scroll_offset = 0;
 
 static void hud_render_message(unsigned int channel, unsigned int k) {
 char *c;
 float x, y;
+
+/* For the global chat channel, allow scrolling back through history
+ * while the chat input is open. The offset is driven by the scroll
+ * wheel (see hud_ingame_scroll). */
+unsigned int idx = k + 1;
+if(channel == 0)
+	idx += chat_scroll_offset;
+if(idx > 127)
+	idx = 127;
 
 if(channel == 0) {
 x = 16.F;
@@ -568,9 +578,9 @@ y = settings.window_height - 22.0F - 10.0F * k - k * 8.F;
 
 // Check if this message contains any mention word
 int is_mentioned = 0;
-if(settings.chat_mention_words[0] != '\0' && channel == 0 && *chat[channel][k + 1] != '\0') {
+if(settings.chat_mention_words[0] != '\0' && channel == 0 && *chat[channel][idx] != '\0') {
 char msg_copy[256];
-strncpy(msg_copy, chat[channel][k + 1], 255);
+strncpy(msg_copy, chat[channel][idx], 255);
 msg_copy[255] = '\0';
 
 // Convert message to lowercase for comparison
@@ -603,11 +613,11 @@ token = strtok(NULL, ", ");
 }
 
 
-if(channel == 0 && *chat[channel][k + 1] != '\0') {
+if(channel == 0 && *chat[channel][idx] != '\0') {
 if(is_mentioned) {
 glColor3ub(settings.chat_mention_r, settings.chat_mention_g, settings.chat_mention_b);
 } else {
-glColor3ub(red(chat_color[channel][k + 1]), green(chat_color[channel][k + 1]), blue(chat_color[channel][k + 1]));
+glColor3ub(red(chat_color[channel][idx]), green(chat_color[channel][idx]), blue(chat_color[channel][idx]));
 }
 glLineWidth(3);
 glBegin(GL_LINES);
@@ -623,7 +633,7 @@ glColor3ub(255, 255, 255);
 
 char buffer[512];
 unsigned int i = 0;
-for(c = chat[channel][k + 1]; *c != '\0'; c++) {
+for(c = chat[channel][idx]; *c != '\0'; c++) {
 // Chat color
 if(*c > 7) {
 buffer[i++] = *c;
@@ -786,6 +796,58 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 			glColor3f(1.0F, 1.0F, 1.0F);
 		}
 
+		// Always render team scores at top of screen
+		if(network_connected && network_logged_in) {
+			for(int i = 0; i < 2; i++) {
+				struct Team team;
+				float x_offset;
+
+				float r, g, b;
+
+				switch(i) {
+					case 0: team = gamestate.team_1; x_offset = settings.window_width / 2.F - 75.F; break;
+					case 1: team = gamestate.team_2; x_offset = settings.window_width / 2.F; break;
+				}
+
+				r = team.red / 255.F;
+				g = team.green / 255.F;
+				b = team.blue / 255.F;
+
+				char score_str[8];
+				glColor3ub(team.red, team.green, team.blue);
+
+				switch(gamestate.gamemode_type) {
+					case GAMEMODE_CTF:
+						sprintf(score_str, "%i-%i",
+								i == 0 ? gamestate.gamemode.ctf.team_1_score:
+															   gamestate.gamemode.ctf.team_2_score,
+								gamestate.gamemode.ctf.capture_limit);
+						break;
+					case GAMEMODE_TC: {
+						int t = 0;
+						for(int k = 0; k < gamestate.gamemode.tc.territory_count; k++)
+							if(gamestate.gamemode.tc.territory[k].team == TEAM_1)
+								t++;
+						sprintf(score_str, "%i-%i", t, gamestate.gamemode.tc.territory_count);
+						break;
+					}
+				}
+
+				float score_width = font_length(16.F, score_str);
+				float box_width = score_width + 20.F;
+
+				glColor4f(0, 0, 0, 0.5F);
+				glEnable(GL_BLEND);
+				glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+				glColor4f(r, g, b, 1.F);
+				texture_draw_empty(x_offset, settings.window_height - 24.F, box_width, 24.F);
+				glDisable(GL_BLEND);
+
+				glColor3ub(255, 255, 255);
+				font_render(x_offset + 10.F, settings.window_height - 27.F, 16.0F, score_str);
+			}
+		}
+
 		if(chat_input_mode == CHAT_NO_INPUT && window_key_down(WINDOW_KEY_TAB) || camera_mode == CAMERAMODE_SELECTION) {
 			if(network_connected && network_logged_in) {
 				char ping_str[16];
@@ -794,9 +856,6 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 				font_centered(settings.window_width / 2.0F, settings.window_height - 4.F, 16.F, ping_str);
 			}
 
-			glColor3f(1.0F, 1.0F, 1.0F);
-			texture_draw(&texture_splash, (settings.window_width - 210 * scalef) * 0.5F, 599 * scalef, 210 * scalef,
-						 150 * scalef);
 
 			int count_team1 = 1;
 			int count_team2 = 1;
@@ -1182,15 +1241,17 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 				float chat_width = 0;
 				int chat_height = 0;
 				for(int k = 0; k < chat_messages; k++) {
-					if((window_time() - chat_timer[0][k + 1] < 10.0F || chat_input_mode != CHAT_NO_INPUT)
-					   && strlen(chat[0][k + 1]) > 0) {
-						chat_width = fmaxf(font_length(16.0F, chat[0][k + 1]), chat_width);
+					int idx = k + 1 + chat_scroll_offset;
+					if(idx > 127) idx = 127;
+					if((window_time() - chat_timer[0][idx] < 10.0F || chat_input_mode != CHAT_NO_INPUT)
+					   && strlen(chat[0][idx]) > 0) {
+						chat_width = fmaxf(font_length(16.0F, chat[0][idx]), chat_width);
 						chat_height = k + 1;
 					}
 
 				}
 
-				if(chat != CHAT_NO_INPUT) {
+				if(chat_input_mode != CHAT_NO_INPUT) {
 					chat_width = fmaxf(chat_width, font_length(16.0F, chat[0][0]));
 				}
 
@@ -1254,7 +1315,9 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 
 			for(int k = 0; k < chat_messages; k++) {
 				glColor3ub(255, 255, 255);
-				if(window_time() - chat_timer[0][k + 1] < 10.0F || chat_input_mode != CHAT_NO_INPUT) {
+				int idx0 = k + 1 + chat_scroll_offset;
+				if(idx0 > 127) idx0 = 127;
+				if(window_time() - chat_timer[0][idx0] < 10.0F || chat_input_mode != CHAT_NO_INPUT) {
 					hud_render_message(0, k);
 				}
 
@@ -1634,6 +1697,23 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 }
 
 static void hud_ingame_scroll(double yoffset) {
+	/* While the chat input is open, the scroll wheel pages through the
+	 * chat history instead of switching weapons. yoffset > 0 scrolls
+	 * toward older messages; yoffset < 0 scrolls back toward the newest. */
+	if(chat_input_mode != CHAT_NO_INPUT && yoffset != 0.0F) {
+		int max_offset = 127 - chat_messages;
+		if(max_offset < 0) max_offset = 0;
+		static float scroll_accum = 0.0F;
+		scroll_accum += (yoffset > 0) ? 0.5F : -0.5F;
+		int step = (int)scroll_accum;
+		if(step != 0) {
+			scroll_accum -= step;
+			chat_scroll_offset += step;
+			if(chat_scroll_offset < 0) chat_scroll_offset = 0;
+			if(chat_scroll_offset > max_offset) chat_scroll_offset = max_offset;
+		}
+		return;
+	}
 	if(camera_mode == CAMERAMODE_FPS && yoffset != 0.0F) {
 		int h = players[local_player_id].held_item;
 		if(!players[local_player_id].items_show)
@@ -1952,9 +2032,6 @@ static void hud_ingame_keyboard(int key, int action, int mods, int internal) {
 					players[local_player_id].pos.y = 63.0F;
 					players[local_player_id].pos.z = 256.0F;
 				}
-				if(key == WINDOW_KEY_CROUCH) {
-					players[local_player_id].alive = !players[local_player_id].alive;
-				}
 			}
 
 			if(key == WINDOW_KEY_NO || (show_exit && key == WINDOW_KEY_ESCAPE)) {
@@ -1964,9 +2041,10 @@ static void hud_ingame_keyboard(int key, int action, int mods, int internal) {
 			} else if(key == WINDOW_KEY_YES) {
 				if(show_exit) {
 					hud_change(&hud_serverlist);
-				} else if(!window_key_down(WINDOW_KEY_CROUCH)) {
+				} else {
 					window_textinput(1);
 					chat_input_mode = CHAT_TEAM_INPUT;
+					chat_scroll_offset = 0;
 				}
 			}
 
@@ -1994,15 +2072,17 @@ static void hud_ingame_keyboard(int key, int action, int mods, int internal) {
 				chat_add(0, 0x00FFFF, volstr);
 			}
 
-			if(key == WINDOW_KEY_COMMAND && !window_key_down(WINDOW_KEY_CROUCH)) {
+			if(key == WINDOW_KEY_COMMAND) {
 				window_textinput(1);
 				chat_input_mode = CHAT_ALL_INPUT;
+				chat_scroll_offset = 0;
 				strcpy(chat[0][0], "/");
 			}
 
-			if(key == WINDOW_KEY_CHAT && !window_key_down(WINDOW_KEY_CROUCH)) {
+			if(key == WINDOW_KEY_CHAT) {
 				window_textinput(1);
 				chat_input_mode = CHAT_ALL_INPUT;
+				chat_scroll_offset = 0;
 			}
 
 			if((key == WINDOW_KEY_CURSOR_UP || key == WINDOW_KEY_CURSOR_DOWN || key == WINDOW_KEY_CURSOR_LEFT
@@ -2270,6 +2350,7 @@ static void hud_ingame_keyboard(int key, int action, int mods, int internal) {
 				}
 				window_textinput(0);
 				chat_input_mode = CHAT_NO_INPUT;
+				chat_scroll_offset = 0;
 				chat[0][0][0] = 0;
 			}
 			if(key == WINDOW_KEY_BACKSPACE) {
