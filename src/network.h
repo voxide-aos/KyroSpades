@@ -19,6 +19,7 @@
 
 #ifndef NETWORK_H
 #define NETWORK_H
+#include <stdint.h>
 
 #if defined(__amd64__) || defined(__x86_64__)
 #define BS_VER_ARCH "x86_64"
@@ -83,6 +84,8 @@ void read_PacketVersionGet(void* data, int len);
 extern void (*packets[256])(void* data, int len);
 extern int network_connected;
 extern int network_logged_in;
+extern char network_current_ip[64];
+extern int  network_current_port;
 extern int network_map_transfer;
 extern int network_received_packets;
 
