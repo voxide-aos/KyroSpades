@@ -1,11 +1,14 @@
 # KyroSpades (Enhanced ButterSpades)
 This project is a modified fork of [ButterSpades](https://github.com/utf-4096/butterspades), introducing several quality-of-life improvements and visual enhancements. Link: https://github.com/Kyrope01/KyroSpades
-#### Date of latest update: 23th May, 2026
+KyroSpades Discord server: https://discord.gg/FM7vSxtug4
+#### Date of latest update: 8th June, 2026
 
 ## New Features
 | Feature | Description |
 | :--- | :--- |
+| **Skins Menu Added** | Now you can easily switch skins of rifle, smg, shotgun, grenade, spade, intel and tent in the skins menu which apply instantly, even during gameplay. |
 | **Demo Recording and Replay** | Auto record demo setting added, is turned off by default, but when enabled starts recording demo automatically. Clicking on a demo in demo list opens up the demo in the demo replayer. |
+| **Editable Fog Distance & Color in Spectator** | You can now change fog distance in spectator mode settings and pressing arrow keys changes color of fog using block's color pallete. |
 | **Gun Sound Variability** | Each time a shot is fired the sound's pitch and loudness are changed randomly to give it a slightly different but similar sound every time, which is a lot better than the very same sound every time. |
 | **Dynamic FOV** | Fov increases while running and decreases while crouching (has smooth animations) making gameplay feel much better. |
 | **Chat Log Menu** | Chat log menu with filters for messages from specific players/the server and ability to select and copy text. |
@@ -25,6 +28,14 @@ This project is a modified fork of [ButterSpades](https://github.com/utf-4096/bu
 | **Hit Indicators Added** | Hit indicator sounds have been added. |
 | **Chat Scroll Added** | Can scroll chat using scroll wheel when chat window is opened. |
 | **Visible Team Scores at Top** | Score table does not need to be opened for seeing score of teams, a small score display is always visible. |
+| **Player Statistics Display Added** | A setting which when enabled displays player stats on left side of screen, the stats displayed are: distance traveled, number of jumps, number of kills, total number of blocks placed, number of headshot kills and the number of deaths. |
+| **Player Stats & Technical Stats Display** | Displays player stats (blocks traveled, no. of times jumped, kills, deaths, no. of headshot kills and blocks placed) and displays technical stats (no. of voxels loaded, no. of particles loaded, no. of vertices of particles, no. of particles being created per second). |
+| **Settings Apply Instantly When Changed**| You now don't need to scroll and click on apply changes button for the settings to apply, they are applied as soon as a value is changed.** |
+| **Custom Coloring** | You can now adjust exposure, saturation, contrast and vignette of game during gameplay to make the game look better. |
+| **Improved Settings Menu** | Settings menu UI has been improved a lot. |
+| **Server Pinning Added** | Right clicking on a server in the server list highlights it and pins it to the top of the server list. |
+| **Textured Blocks Added** | Blocks can now have textures when textured blocks are enabled. |
+
 
 ## Quick Setup: Dynamic Wallpapers
 To add custom wallpapers, in folder named `bg` inside the `png` folder in directory of your client. Drop any `.png` images you like into that folder, and the client will cycle through them randomly each time you start the game.

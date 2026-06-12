@@ -36,6 +36,7 @@
 #include "weapon.h"
 #include "window.h"
 #include "particle.h"
+#include "hud.h"
 
 struct GameState gamestate;
 
@@ -93,6 +94,8 @@ int overlaps_with_player(int bx, int by, int bz) {
 
 int button_map[3];
 
+struct CorpseEntry corpses[CORPSE_MAX];
+
 unsigned char local_player_id = 0;
 unsigned char local_player_health = 100;
 unsigned char local_player_blocks = 50;
@@ -113,6 +116,7 @@ char local_player_drag_active = 0;
 int local_player_drag_x;
 int local_player_drag_y;
 int local_player_drag_z;
+int local_player_drag_amount = 0;
 
 /* Pending block placement when airborne */
 char local_player_pending_block_active = 0;
@@ -132,17 +136,134 @@ struct Player players[PLAYERS_MAX];
 #define WEAPON_PRIMARY 1
 #define FALL_DAMAGE_SCALAR 4096
 
+void player_save_corpse(int player_id) {
+	if(player_id < 0 || player_id >= PLAYERS_MAX)
+		return;
+	if(!settings.disable_corpse_despawn)
+		return;
+
+	struct Player* p = &players[player_id];
+
+	/* find a free slot */
+	int slot = -1;
+	for(int k = 0; k < CORPSE_MAX; k++) {
+		if(!corpses[k].active) {
+			slot = k;
+			break;
+		}
+	}
+	/* if full, evict oldest (first active slot) */
+	if(slot < 0) {
+		for(int k = 0; k < CORPSE_MAX; k++) {
+			if(corpses[k].active) {
+				slot = k;
+				break;
+			}
+		}
+	}
+	if(slot < 0)
+		return;
+
+	corpses[slot].active = 1;
+	corpses[slot].player_id = player_id;
+	corpses[slot].pos = p->pos;
+	corpses[slot].orientation = p->orientation;
+	corpses[slot].orientation_smooth = p->orientation_smooth;
+	corpses[slot].velocity = p->physics.velocity;
+	corpses[slot].team = p->team;
+}
+
+void player_clear_corpses(void) {
+	for(int k = 0; k < CORPSE_MAX; k++)
+		corpses[k].active = 0;
+}
+
+void player_update_corpses(float dt) {
+	if(!settings.disable_corpse_despawn)
+		return;
+
+	for(int k = 0; k < CORPSE_MAX; k++) {
+		if(!corpses[k].active)
+			continue;
+
+		/* skip corpses whose player is still dead (regular path handles them) */
+		int pid = corpses[k].player_id;
+		if(pid >= 0 && pid < PLAYERS_MAX && !players[pid].alive && players[pid].connected)
+			continue;
+
+		/* freeze settled corpses */
+		if(corpses[k].velocity.x * corpses[k].velocity.x
+			 + corpses[k].velocity.y * corpses[k].velocity.y
+			 + corpses[k].velocity.z * corpses[k].velocity.z < 0.001F)
+			continue;
+
+		corpses[k].velocity.y -= dt;
+
+		AABB dead_bb = {0};
+		aabb_set_size(&dead_bb, 0.7F, 0.15F, 0.7F);
+		aabb_set_center(&dead_bb,
+			corpses[k].pos.x + corpses[k].velocity.x * dt * 32.0F,
+			corpses[k].pos.y + corpses[k].velocity.y * dt * 32.0F,
+			corpses[k].pos.z + corpses[k].velocity.z * dt * 32.0F);
+
+		if(!aabb_intersection_terrain(&dead_bb, 0)) {
+			corpses[k].pos.x += corpses[k].velocity.x * dt * 32.0F;
+			corpses[k].pos.y += corpses[k].velocity.y * dt * 32.0F;
+			corpses[k].pos.z += corpses[k].velocity.z * dt * 32.0F;
+		} else {
+			corpses[k].velocity.x *= 0.36F;
+			corpses[k].velocity.y *= -0.36F;
+			corpses[k].velocity.z *= 0.36F;
+		}
+	}
+}
+
+void player_render_corpses(void) {
+	if(!settings.disable_corpse_despawn)
+		return;
+
+	for(int k = 0; k < CORPSE_MAX; k++) {
+		if(!corpses[k].active)
+			continue;
+
+		int pid = corpses[k].player_id;
+
+		/* skip if the player is still dead and connected (regular render handles it) */
+		if(pid >= 0 && pid < PLAYERS_MAX && !players[pid].alive && players[pid].connected)
+			continue;
+
+		struct CorpseEntry* c = &corpses[k];
+
+		float l = sqrt(distance3D(c->orientation_smooth.x, c->orientation_smooth.y, c->orientation_smooth.z, 0, 0, 0));
+		float ox = c->orientation_smooth.x / l;
+		float oz = c->orientation_smooth.z / l;
+
+		matrix_push(matrix_model);
+		matrix_translate(matrix_model, c->pos.x, c->pos.y + 0.25F, c->pos.z);
+		matrix_pointAt(matrix_model, ox, 0.0F, oz);
+		matrix_rotate(matrix_model, 90.0F, 0.0F, 1.0F, 0.0F);
+		if(c->velocity.y < 0.05F && c->pos.y < 1.5F)
+			matrix_translate(matrix_model, 0.0F, (sin(game_time() * 1.5F) - 1.0F) * 0.1F, 0.0F);
+		matrix_upload();
+		kv6_render(&model_playerdead, c->team);
+		matrix_pop(matrix_model);
+	}
+}
+
 void player_init() {
 	for(int k = 0; k < PLAYERS_MAX; k++) {
 		player_reset(&players[k]);
 		players[k].score = 0;
 	}
+	player_clear_corpses();
 }
 
 void player_reset(struct Player* p) {
 	p->connected = 0;
 	p->alive = 0;
 	p->held_item = TOOL_GUN;
+	p->weapon = 0;
+	p->weapon_last_shot = 0;
 	p->block.red = 111;
 	p->block.green = 111;
 	p->block.blue = 111;
@@ -246,42 +367,39 @@ float* player_tool_func(const struct Player* p) {
 float* player_tool_translate_func(struct Player* p) {
 	static float ret[3];
 	ret[0] = ret[1] = ret[2] = 0.0F;
-	if(p == &players[local_player_id] && camera_mode == CAMERAMODE_FPS) {
-		if(game_time() - p->item_showup < 0.5F) {
-			return ret;
-		}
-		if(p->held_item == TOOL_GUN
-		   && game_time() - weapon_last_shot < weapon_delay(players[local_player_id].weapon)) {
-			ret[2] = -(weapon_delay(players[local_player_id].weapon) - (game_time() - weapon_last_shot))
-				/ weapon_delay(players[local_player_id].weapon) * weapon_recoil_anim(players[local_player_id].weapon)
-				* (local_player_ammo > 0);
-			return ret;
-		}
+	if(game_time() - p->item_showup < 0.5F) {
+		return ret;
+	}
+	if(p->held_item == TOOL_GUN
+	   && game_time() - p->weapon_last_shot < weapon_delay(p->weapon)) {
+		ret[2] = -(weapon_delay(p->weapon) - (game_time() - p->weapon_last_shot))
+			/ weapon_delay(p->weapon) * weapon_recoil_anim(p->weapon);
+		return ret;
+	}
 
-		if(p->held_item == TOOL_SPADE) {
-			float t = game_time() - p->spade_use_timer;
-			if(t > 1.0F) {
+	if(p->held_item == TOOL_SPADE) {
+		float t = game_time() - p->spade_use_timer;
+		if(t > 1.0F) {
+			return ret;
+		}
+		if(p->spade_use_type == 2) {
+			if(t > 0.4F && t <= 0.7F) {
+				ret[2] = (t - 0.4F) / 0.3F * 0.8F;
 				return ret;
 			}
-			if(p->spade_use_type == 2) {
-				if(t > 0.4F && t <= 0.7F) {
-					ret[2] = (t - 0.4F) / 0.3F * 0.8F;
-					return ret;
-				}
-				if(t > 0.7F) {
-					ret[2] = (0.3F - (t - 0.7F)) / 0.3F * 0.8F;
-					return ret;
-				}
+			if(t > 0.7F) {
+				ret[2] = (0.3F - (t - 0.7F)) / 0.3F * 0.8F;
+				return ret;
 			}
 		}
-		if(p->held_item == TOOL_GRENADE) {
-			if(p->input.buttons.lmb) {
-				ret[1] = (game_time() - p->input.buttons.lmb_start) * 1.3F;
-				ret[0] = -ret[1];
-				return ret;
-			} else {
-				return ret;
-			}
+	}
+	if(p->held_item == TOOL_GRENADE) {
+		if(p->input.buttons.lmb) {
+			ret[1] = (game_time() - p->input.buttons.lmb_start) * 1.3F;
+			ret[0] = -ret[1];
+			return ret;
+		} else {
+			return ret;
 		}
 	}
 	return ret;
@@ -359,6 +477,7 @@ void player_update(float dt, int locked) {
 			}
 		}
 	}
+	player_update_corpses(dt);
 }
 
 void player_render_all() {
@@ -523,6 +642,8 @@ void player_render_all() {
 			}
 		}
 	}
+
+	player_render_corpses();
 }
 
 static float foot_function(const struct Player* p) {
@@ -1181,6 +1302,9 @@ int player_move(struct Player* p, float fsynctics, int id) {
 
 	// move player and perform simple physics (gravity, momentum, friction)
 	if(p->physics.jump) {
+		if(settings.player_stats && id == local_player_id) {
+			player_stats_jumps++;
+		}
 		sound_create(local ? SOUND_LOCAL : SOUND_WORLD, p->physics.wade ? &sound_jump_water : &sound_jump, p->pos.x,
 					 63.0F - p->pos.z, p->pos.y);
 		p->physics.jump = 0;

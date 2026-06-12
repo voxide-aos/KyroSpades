@@ -46,6 +46,7 @@
 #include "matrix.h"
 #include "texture.h"
 #include "chunk.h"
+#include "skins.h"
 #include "chatlog.h"
 #include "main.h"
 
@@ -58,6 +59,25 @@ int ms_rand() {
 	ms_seed = ms_seed * 0x343FD + 0x269EC3;
 	return (ms_seed >> 0x10) & 0x7FFF;
 }
+
+static struct {
+	unsigned int texture;
+	unsigned int shader;
+	unsigned int fbo;
+	unsigned int depth_rb;
+	int w;
+	int h;
+	int uni_exposure;
+	int uni_saturation;
+	int uni_contrast;
+	int uni_vignette;
+} postproc = {0};
+
+static struct {
+	bool active;
+	double start_time;
+	int texture;
+} screenshot_anim = {0};
 
 int chat_input_mode = CHAT_NO_INPUT;
 
@@ -139,14 +159,35 @@ void chat_showpopup(const char* msg, float duration, int color) {
 }
 
 void drawScene() {
+	window_apply();
+
 	if(settings.ambient_occlusion) {
 		glShadeModel(GL_SMOOTH);
 	} else {
 		glShadeModel(GL_FLAT);
 	}
 
+	if(settings.textured_blocks) {
+#ifndef OPENGL_ES
+		if(glx_fog) {
+			glFogi(GL_FOG_MODE, GL_LINEAR);
+			glFogf(GL_FOG_START, 0.0F);
+			glFogf(GL_FOG_END, settings.render_distance);
+			glFogfv(GL_FOG_COLOR, fog_color);
+			glEnable(GL_FOG);
+		}
+#endif
+	}
+
 	matrix_upload();
 	chunk_draw_visible();
+
+	if(settings.textured_blocks) {
+#ifndef OPENGL_ES
+		if(glx_fog)
+			glDisable(GL_FOG);
+#endif
+	}
 
 	if(settings.smooth_fog) {
 #ifdef OPENGL_ES
@@ -235,13 +276,96 @@ void display() {
 		glClearColor(fog_color[0], fog_color[1], fog_color[2], fog_color[3]);
 	}
 
+	int needs_postproc = (glx_version && (settings.exposure != 0 || settings.saturation != 0 || settings.contrast != 0 || settings.vignette != 0));
+
 	if(hud_active->render_world || network_connected) {
+		if(needs_postproc) {
+			if(postproc.texture && (postproc.w != settings.window_width || postproc.h != settings.window_height)) {
+				glDeleteFramebuffers(1, &postproc.fbo);
+				glDeleteRenderbuffers(1, &postproc.depth_rb);
+				glDeleteTextures(1, &postproc.texture);
+				postproc.fbo = 0;
+				postproc.depth_rb = 0;
+				postproc.texture = 0;
+			}
+
+			if(!postproc.texture) {
+				glGenTextures(1, &postproc.texture);
+				glBindTexture(GL_TEXTURE_2D, postproc.texture);
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, settings.window_width, settings.window_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+				glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			}
+
+			if(!postproc.fbo) {
+				glGenFramebuffers(1, &postproc.fbo);
+				glBindFramebuffer(GL_FRAMEBUFFER, postproc.fbo);
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, postproc.texture, 0);
+				glGenRenderbuffers(1, &postproc.depth_rb);
+				glBindRenderbuffer(GL_RENDERBUFFER, postproc.depth_rb);
+				glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, settings.window_width, settings.window_height);
+				glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, postproc.depth_rb);
+				if(glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+					glDeleteFramebuffers(1, &postproc.fbo);
+					glDeleteRenderbuffers(1, &postproc.depth_rb);
+					glDeleteTextures(1, &postproc.texture);
+					postproc.fbo = 0;
+					postproc.depth_rb = 0;
+					postproc.texture = 0;
+				}
+				glBindFramebuffer(GL_FRAMEBUFFER, 0);
+				glBindRenderbuffer(GL_RENDERBUFFER, 0);
+			}
+
+			postproc.w = settings.window_width;
+			postproc.h = settings.window_height;
+
+			if(!postproc.shader) {
+				const char* vert = "void main(){gl_TexCoord[0]=gl_MultiTexCoord0;gl_Position=ftransform();}";
+				const char* frag =
+					"uniform float exposure;"
+					"uniform float saturation;"
+					"uniform float contrast;"
+					"uniform float vignette;"
+					"uniform sampler2D tex;"
+					"void main(){"
+					"vec4 c=texture2D(tex,gl_TexCoord[0].xy);"
+					"float e=1.0+exposure/100.0;"
+					"c.rgb*=e;"
+					"float g=dot(c.rgb,vec3(0.299,0.587,0.114));"
+					"float s=1.0+saturation/100.0;"
+					"c.rgb=mix(vec3(g),c.rgb,s);"
+					"float ct=1.0+contrast/100.0;"
+					"c.rgb=(c.rgb-0.5)*ct+0.5;"
+					"float vig=1.0-(vignette/100.0)*dot(gl_TexCoord[0].xy-0.5,gl_TexCoord[0].xy-0.5)*4.0;"
+					"c.rgb*=clamp(vig,0.0,1.0);"
+					"c.rgb=clamp(c.rgb,0.0,1.0);"
+					"gl_FragColor=c;}";
+				postproc.shader = glx_shader(vert, frag);
+				if(postproc.shader) {
+					postproc.uni_exposure = glGetUniformLocation(postproc.shader, "exposure");
+					postproc.uni_saturation = glGetUniformLocation(postproc.shader, "saturation");
+					postproc.uni_contrast = glGetUniformLocation(postproc.shader, "contrast");
+					postproc.uni_vignette = glGetUniformLocation(postproc.shader, "vignette");
+				}
+			}
+
+			if(postproc.fbo)
+				glBindFramebuffer(GL_FRAMEBUFFER, postproc.fbo);
+		}
+
 		glEnable(GL_DEPTH_TEST);
 		glDepthRange(0.0F, 1.0F);
 
 		chunk_update_all();
 
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+		float saved_render_distance = settings.render_distance;
+		if(camera_mode == CAMERAMODE_SPECTATOR)
+			settings.render_distance = settings.spectator_fog_distance;
 
 		if(settings.opengl14) {
 			matrix_identity(matrix_projection);
@@ -262,11 +386,9 @@ void display() {
 		camera_ExtractFrustum();
 
 		if(!network_map_transfer) {
-			if(network_connected)
-				glx_enable_sphericalfog();
-			else if(hud_active->render_world || camera_mode == CAMERAMODE_SPECTATOR || camera_mode == CAMERAMODE_BODYVIEW)
-				glx_enable_sphericalfog();
+			glx_enable_sphericalfog();
 			drawScene();
+			settings.render_distance = saved_render_distance;
 
 			int render_fpv = (camera_mode == CAMERAMODE_FPS)
 				|| ((camera_mode == CAMERAMODE_BODYVIEW || camera_mode == CAMERAMODE_SPECTATOR)
@@ -275,7 +397,7 @@ void display() {
 			int local_id = (camera_mode == CAMERAMODE_FPS) ? local_player_id : cameracontroller_bodyview_player;
 			
 			// Validate local_id before any array access to prevent crashes in spectator mode
-			if(local_id >= PLAYERS_MAX) {
+			if(local_id < 0 || local_id >= PLAYERS_MAX) {
 				local_id = local_player_id;
 			}
 
@@ -348,6 +470,7 @@ void display() {
 				}
 			}
 
+			local_player_drag_amount = 0;
 			int* pos = NULL;
 			switch(players[local_id].held_item) {
 				case TOOL_BLOCK:
@@ -374,6 +497,7 @@ void display() {
 				   && players[local_player_id].held_item == TOOL_BLOCK) {
 					amount = map_cube_line(local_player_drag_x, local_player_drag_z, 63 - local_player_drag_y, pos[0],
 										   pos[2], 63 - pos[1], cubes);
+					local_player_drag_amount = amount;
 				} else {
 					amount = 1;
 					cubes[0].x = pos[0];
@@ -480,6 +604,58 @@ void display() {
 			glx_disable_sphericalfog();
 			if(settings.smooth_fog)
 				glDisable(GL_FOG);
+
+			if(needs_postproc) {
+				glMatrixMode(GL_PROJECTION);
+				glPushMatrix();
+				glLoadIdentity();
+				glOrtho(0.0, settings.window_width, 0.0, settings.window_height, -1.0, 1.0);
+				glMatrixMode(GL_MODELVIEW);
+				glPushMatrix();
+				glLoadIdentity();
+
+				glDisable(GL_DEPTH_TEST);
+				glDepthMask(GL_FALSE);
+
+				if(postproc.fbo) {
+					glBindFramebuffer(GL_FRAMEBUFFER, 0);
+					glBindTexture(GL_TEXTURE_2D, postproc.texture);
+				} else if(postproc.texture) {
+					glReadBuffer(GL_BACK);
+					glBindTexture(GL_TEXTURE_2D, postproc.texture);
+					glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, settings.window_width, settings.window_height);
+				}
+
+				if(postproc.shader) {
+					glUseProgram(postproc.shader);
+					glUniform1f(postproc.uni_exposure, settings.exposure);
+					glUniform1f(postproc.uni_saturation, settings.saturation);
+					glUniform1f(postproc.uni_contrast, settings.contrast);
+					glUniform1f(postproc.uni_vignette, settings.vignette);
+
+					glBegin(GL_QUADS);
+					glTexCoord2f(0.0F, 0.0F); glVertex2f(0.0F, 0.0F);
+					glTexCoord2f(1.0F, 0.0F); glVertex2f((float)settings.window_width, 0.0F);
+					glTexCoord2f(1.0F, 1.0F); glVertex2f((float)settings.window_width, (float)settings.window_height);
+					glTexCoord2f(0.0F, 1.0F); glVertex2f(0.0F, (float)settings.window_height);
+					glEnd();
+
+					glUseProgram(0);
+				}
+
+				glBindTexture(GL_TEXTURE_2D, 0);
+				glDepthMask(GL_TRUE);
+				glClear(GL_DEPTH_BUFFER_BIT);
+				glEnable(GL_DEPTH_TEST);
+
+				glMatrixMode(GL_PROJECTION);
+				glPopMatrix();
+				glMatrixMode(GL_MODELVIEW);
+				glPopMatrix();
+			}
+		}
+		if(needs_postproc && network_map_transfer && postproc.fbo) {
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		}
 	}
 
@@ -494,8 +670,8 @@ void display() {
 	matrix_identity(matrix_model);
 	matrix_upload();
 	matrix_upload_p();
-	float scalex = settings.window_width / 800.0F;
-	float scalef = settings.window_height / 600.0F;
+	float scalex = (settings.window_width / 800.0F);
+	float scalef = (settings.window_height / 600.0F);
 
 	if(hud_active->render_2D) {
 		mu_Context* ctx = hud_active->ctx;
@@ -567,6 +743,45 @@ void display() {
 		}
 	}
 
+	if(screenshot_anim.active && screenshot_anim.texture) {
+		double elapsed = window_time() - screenshot_anim.start_time;
+		float t = (float)(elapsed / 1.5);
+		if(t >= 1.0F) {
+			screenshot_anim.active = false;
+			glDeleteTextures(1, (GLuint*)&screenshot_anim.texture);
+			screenshot_anim.texture = 0;
+		} else {
+			float target_scale = 1.0F / 6.0F;
+			float margin = 10.0F;
+			float shrink_end = 0.2F;
+			float fade_start = 0.63F;
+			float ease = min(t / shrink_end, 1.0F);
+			float w = (float)settings.window_width * (1.0F + (target_scale - 1.0F) * ease);
+			float h = (float)settings.window_height * (1.0F + (target_scale - 1.0F) * ease);
+			float x = margin * ease;
+			float y = (float)settings.window_height - margin * ease;
+			float alpha = t <= fade_start ? 1.0F : 1.0F - (t - fade_start) / (1.0F - fade_start);
+
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+			glEnable(GL_TEXTURE_2D);
+			glBindTexture(GL_TEXTURE_2D, screenshot_anim.texture);
+			glColor4f(1.0F, 1.0F, 1.0F, alpha);
+			texture_draw_empty(x, y, w, h);
+			glDisable(GL_TEXTURE_2D);
+			glLineWidth(2.0F);
+			glColor4f(1.0F, 1.0F, 1.0F, alpha);
+			glBegin(GL_LINE_LOOP);
+			glVertex2f(x, y);
+			glVertex2f(x + w, y);
+			glVertex2f(x + w, y - h);
+			glVertex2f(x, y - h);
+			glEnd();
+			glBindTexture(GL_TEXTURE_2D, 0);
+			glDisable(GL_BLEND);
+		}
+	}
+
 	if(settings.multisamples > 0)
 		glEnable(GL_MULTISAMPLE);
 }
@@ -598,6 +813,7 @@ void init() {
 	kv6_init();
 	texture_init();
 	sound_init();
+	skins_init();
 	tracer_init();
 	hud_init();
 	chunk_init();
@@ -739,6 +955,11 @@ void keys(struct window_instance* window, int key, int scancode, int action, int
 			settings.fullscreen = 0;
 		}
 	}
+#else
+	if(key == WINDOW_KEY_FULLSCREEN && action == WINDOW_PRESS) {
+		settings.fullscreen = !settings.fullscreen;
+		window_fromsettings();
+	}
 #endif
 
 	if(key == WINDOW_KEY_SCREENSHOT && action == WINDOW_PRESS) { // take screenshot
@@ -749,7 +970,9 @@ void keys(struct window_instance* window, int key, int scancode, int action, int
 
 		unsigned char* pic_data = malloc(settings.window_width * settings.window_height * 4 * 2);
 		CHECK_ALLOCATION_ERROR(pic_data)
+		glReadBuffer(GL_FRONT);
 		glReadPixels(0, 0, settings.window_width, settings.window_height, GL_RGBA, GL_UNSIGNED_BYTE, pic_data);
+		glReadBuffer(GL_BACK);
 
 		for(int y = 0; y < settings.window_height; y++) { // mirror image (top-bottom)
 			for(int x = 0; x < settings.window_width; x++)
@@ -760,10 +983,27 @@ void keys(struct window_instance* window, int key, int scancode, int action, int
 
 		lodepng_encode32_file(pic_name, pic_data + settings.window_width * settings.window_height * 4,
 							  settings.window_width, settings.window_height);
+
+		if(screenshot_anim.texture)
+			glDeleteTextures(1, (GLuint*)&screenshot_anim.texture);
+		glGenTextures(1, (GLuint*)&screenshot_anim.texture);
+		glBindTexture(GL_TEXTURE_2D, screenshot_anim.texture);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, settings.window_width, settings.window_height, 0, GL_RGBA,
+					 GL_UNSIGNED_BYTE, pic_data + settings.window_width * settings.window_height * 4);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		screenshot_anim.active = true;
+		screenshot_anim.start_time = window_time();
+
 		free(pic_data);
 
 		sprintf(pic_name, "Saved screenshot as screenshots/%ld.png", (long)pic_time);
 		chat_add(0, 0x00FFFF, pic_name);
+
+		sound_create(SOUND_LOCAL, &sound_screenshot, 0.0F, 0.0F, 0.0F);
 	}
 
 	if(key == WINDOW_KEY_SAVE_MAP && action == WINDOW_PRESS) { // save map
@@ -830,6 +1070,7 @@ int main(int argc, char** argv) {
 	settings.shadow_entities = 0;
 	settings.ambient_occlusion = 0;
 	settings.render_distance = 128.0F;
+	settings.spectator_fog_distance = 128.0F;
 	settings.window_width = 800;
 	settings.window_height = 600;
 	settings.player_arms = 0;
@@ -847,6 +1088,22 @@ int main(int argc, char** argv) {
 	settings.rifle_ads_fov = CAMERA_DEFAULT_FOV;
 	settings.shotgun_ads_fov = CAMERA_DEFAULT_FOV;
 	settings.smg_ads_fov = CAMERA_DEFAULT_FOV;
+	settings.disable_dynamic_fov = 0;
+	settings.textured_blocks = 0;
+	settings.minimap_zoom = 3;
+	settings.skin_spade = 0;
+	settings.skin_grenade = 0;
+	settings.skin_rifle = 0;
+	settings.skin_smg = 0;
+	settings.skin_shotgun = 0;
+	settings.skin_player = 0;
+	settings.skin_intel = 0;
+	settings.skin_tent = 0;
+	settings.exposure = 5.0F;
+	settings.contrast = 5.0F;
+	settings.vignette = 10.0F;
+	settings.chat_mention_r = 255;
+	settings.chat_mention_g = 255;
 	strcpy(settings.name, "DEV_CLIENT");
 
 #ifdef USE_TOUCH
@@ -873,18 +1130,27 @@ int main(int argc, char** argv) {
 
 	log_info("Game started!");
 
+	settings.iron_sight = 1;
 	config_reload();
+
+	if(settings.debug_log) {
+		log_set_level(LOG_TRACE);
+		log_info("Debug logging enabled (LOG_TRACE)");
+	}
 
 	window_init();
 
 #ifndef OPENGL_ES
 	if(glewInit())
 		log_error("Could not load extended OpenGL functions!");
+	else
+		log_debug("GLEW initialized successfully");
 #endif
 
 	log_info("Vendor: %s", glGetString(GL_VENDOR));
 	log_info("Renderer: %s", glGetString(GL_RENDERER));
 	log_info("Version: %s", glGetString(GL_VERSION));
+	log_debug("GLSL: %s", glGetString(GL_SHADING_LANGUAGE_VERSION));
 
 	if(settings.multisamples > 0) {
 		glEnable(GL_MULTISAMPLE);
@@ -941,26 +1207,47 @@ int main(int argc, char** argv) {
 				}
 			}
 
-			// these run at min. ~60fps but as fast as possible
-			double step = fmin(dt, PHYSICS_STEP_TIME);
-			while(step > 0 && physics_time_fast >= step) {
-				physics_time_fast -= step;
-				if(!demo_is_frozen())
-					player_update(step, 0);
-				camera_update(step);
-				tracer_update(step);
-				particle_update(step);
-				if(settings.rain) {
-					particle_create_rain();
-				}
-				if(settings.snow) {
-					particle_create_snow();
-				}
-				map_collapsing_update(step);
+		// these run at min. ~60fps but as fast as possible
+		// cap catch-up iterations to prevent spiral of death:
+		// if a frame is slow (high dt), the loop would run many times,
+		// each calling expensive camera updates (e.g. bodyview ray-march),
+		// making the next frame even slower in a feedback loop.
+		double step = fmin(dt, PHYSICS_STEP_TIME);
+		int max_catchup = 4;
+		int catchup_count = 0;
+		while(step > 0 && physics_time_fast >= step && catchup_count < max_catchup) {
+			physics_time_fast -= step;
+			if(!demo_is_frozen())
+				player_update(step, 0);
+			camera_update(step);
+			tracer_update(step);
+			particle_update(step);
+			if(settings.rain) {
+				particle_create_rain();
 			}
+			if(settings.snow) {
+				particle_create_snow();
+			}
+			map_collapsing_update(step);
+			catchup_count++;
+		}
+		// discard excess accumulated time to prevent buildup
+		if(physics_time_fast > PHYSICS_STEP_TIME * 2)
+			physics_time_fast = PHYSICS_STEP_TIME;
 		}
 
 		display();
+
+		if(network_map_transfer_end) {
+			static float loading_screen_seen_time = 0.0F;
+			if(loading_screen_seen_time == 0.0F)
+				loading_screen_seen_time = window_time();
+			if(window_time() - loading_screen_seen_time >= 0.5F) {
+				network_map_transfer = 0;
+				network_map_transfer_end = 0;
+				loading_screen_seen_time = 0.0F;
+			}
+		}
 
 		sound_update();
 		network_update();

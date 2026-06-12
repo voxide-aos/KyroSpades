@@ -133,9 +133,13 @@ void cameracontroller_fps(float dt) {
 			target_crouch_offset = 0.0F;
 		}
 		
-		// Quick smooth crouch transition (~100ms)
-		float crouch_lerp_speed = 40.0F * dt;
-		crouch_offset = crouch_offset + (target_crouch_offset - crouch_offset) * fminf(crouch_lerp_speed, 1.0F);
+		if(settings.disable_dynamic_fov) {
+			crouch_offset = target_crouch_offset;
+		} else {
+			// Quick smooth crouch transition (~100ms)
+			float crouch_lerp_speed = 40.0F * dt;
+			crouch_offset = crouch_offset + (target_crouch_offset - crouch_offset) * fminf(crouch_lerp_speed, 1.0F);
+		}
 		
 		// Apply smooth crouch offset to player position and eye
 		if(window_key_down(WINDOW_KEY_CROUCH)) {
@@ -428,7 +432,7 @@ void cameracontroller_spectator(float dt) {
 		// If no valid player found, disable bodyview mode
 		if(!found) {
 			cameracontroller_bodyview_mode = 0;
-			cameracontroller_bodyview_player = -1; // Reset to invalid state
+			cameracontroller_bodyview_player = 0;
 		}
 	}
 
@@ -538,7 +542,7 @@ void cameracontroller_bodyview(float dt) {
 	// If no valid player found, disable bodyview mode
 	if(!found) {
 		cameracontroller_bodyview_mode = 0;
-		cameracontroller_bodyview_player = -1; // Reset to invalid state
+		cameracontroller_bodyview_player = 0;
 		return;
 	}
 
@@ -548,6 +552,9 @@ void cameracontroller_bodyview(float dt) {
 	float k;
 	float traverse_lengths[2] = {-1, -1};
 	for(k = 0.0F; k < 5.0F; k += 0.05F) {
+		// early exit: both forward and backward traverse lengths found
+		if(traverse_lengths[0] >= 0 && traverse_lengths[1] >= 0)
+			break;
 		// Validate cameracontroller_bodyview_player before each access
 		if(cameracontroller_bodyview_player >= PLAYERS_MAX || cameracontroller_bodyview_player < 0) {
 			break;

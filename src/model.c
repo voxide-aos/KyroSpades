@@ -60,8 +60,53 @@ struct kv6_t model_shotgun_casing;
 
 static void kv6_load_file(struct kv6_t* kv6, char* filename, float scale) {
 	void* data = file_load(filename);
+	if(!data) {
+		log_debug("Failed to load model: %s", filename);
+		return;
+	}
 	kv6_load(kv6, data, scale);
+	log_debug("Loaded model: %s (%i voxels)", filename, kv6->voxel_count);
 	free(data);
+}
+
+int model_loaded_count(void) {
+	int count = 0;
+	if(model_playerdead.voxels) count++;
+	if(model_playerhead.voxels) count++;
+	if(model_playertorso.voxels) count++;
+	if(model_playertorsoc.voxels) count++;
+	if(model_playerarms.voxels) count++;
+	if(model_playerleg.voxels) count++;
+	if(model_playerlegc.voxels) count++;
+	if(model_intel.voxels) count++;
+	if(model_tent.voxels) count++;
+	if(model_semi.voxels) count++;
+	if(model_smg.voxels) count++;
+	if(model_shotgun.voxels) count++;
+	if(model_spade.voxels) count++;
+	if(model_block.voxels) count++;
+	if(model_grenade.voxels) count++;
+	if(model_semi_tracer.voxels) count++;
+	if(model_smg_tracer.voxels) count++;
+	if(model_shotgun_tracer.voxels) count++;
+	if(model_semi_casing.voxels) count++;
+	if(model_smg_casing.voxels) count++;
+	if(model_shotgun_casing.voxels) count++;
+	return count;
+}
+
+int model_total_voxels(void) {
+	return model_playerdead.voxel_count + model_playerhead.voxel_count
+		+ model_playertorso.voxel_count + model_playertorsoc.voxel_count
+		+ model_playerarms.voxel_count + model_playerleg.voxel_count
+		+ model_playerlegc.voxel_count + model_intel.voxel_count
+		+ model_tent.voxel_count + model_semi.voxel_count
+		+ model_smg.voxel_count + model_shotgun.voxel_count
+		+ model_spade.voxel_count + model_block.voxel_count
+		+ model_grenade.voxel_count + model_semi_tracer.voxel_count
+		+ model_smg_tracer.voxel_count + model_shotgun_tracer.voxel_count
+		+ model_semi_casing.voxel_count + model_smg_casing.voxel_count
+		+ model_shotgun_casing.voxel_count;
 }
 
 static void kv6_check_dimensions(struct kv6_t* kv6, float max) {
@@ -203,6 +248,20 @@ void kv6_load(struct kv6_t* kv6, void* bytes, float scale) {
 	}
 }
 
+int kv6_reload(struct kv6_t* kv6, const char* path, float orig_scale) {
+	if(!file_exists(path))
+		return -1;
+	void* data = file_load(path);
+	if(!data)
+		return -1;
+	if(kv6->voxels)
+		free(kv6->voxels);
+	kv6_load(kv6, data, orig_scale);
+	free(data);
+	kv6_rebuild(kv6);
+	return 0;
+}
+
 void kv6_rebuild(struct kv6_t* kv6) {
 	if(kv6->has_display_list) {
 		glx_displaylist_destroy(kv6->display_list + 0);
@@ -324,9 +383,9 @@ void kv6_render(struct kv6_t* kv6, unsigned char team) {
 	if(!settings.voxlap_models) {
 		if(!kv6->has_display_list) {
 			struct tesselator tess_color;
-			tesselator_create(&tess_color, VERTEX_INT, 1);
+			tesselator_create(&tess_color, VERTEX_INT, 1, 1);
 			struct tesselator tess_team;
-			tesselator_create(&tess_team, VERTEX_INT, 1);
+			tesselator_create(&tess_team, VERTEX_INT, 1, 1);
 
 			glx_displaylist_create(kv6->display_list + 0, true, true);
 			glx_displaylist_create(kv6->display_list + 1, true, true);
@@ -516,10 +575,10 @@ void kv6_render(struct kv6_t* kv6, unsigned char team) {
 			}
 
 			glx_displaylist_update(kv6->display_list + 0, cnt[0], GLX_DISPLAYLIST_POINTS, colors[0], vertices[0],
-								   normals[0]);
+								   normals[0], NULL);
 
 			glx_displaylist_update(kv6->display_list + 1, cnt[1], GLX_DISPLAYLIST_POINTS, colors[1], vertices[1],
-								   normals[1]);
+								   normals[1], NULL);
 
 			if(kv6_program < 0) {
 				kv6_program

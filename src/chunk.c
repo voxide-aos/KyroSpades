@@ -42,7 +42,9 @@ struct chunk chunks[CHUNKS_PER_DIM * CHUNKS_PER_DIM];
 HashTable chunk_block_queue;
 struct channel chunk_work_queue;
 struct channel chunk_result_queue;
-pthread_mutex_t chunk_block_queue_lock;
+pthread_spinlock_t chunk_block_queue_lock;
+
+int chunk_gen = 0;
 
 struct chunk_work_packet {
 	size_t chunk_x;
@@ -55,6 +57,7 @@ struct chunk_result_packet {
 	int max_height;
 	struct tesselator tesselator;
 	uint32_t* minimap_data;
+	int gen;
 };
 
 struct chunk_render_call {
@@ -69,6 +72,7 @@ void chunk_init() {
 			struct chunk* c = chunks + x + y * CHUNKS_PER_DIM;
 			c->created = false;
 			c->max_height = 1;
+			c->gen = 0;
 			c->x = x;
 			c->y = y;
 		}
@@ -76,9 +80,9 @@ void chunk_init() {
 
 	channel_create(&chunk_work_queue, sizeof(struct chunk_work_packet), CHUNKS_PER_DIM * CHUNKS_PER_DIM);
 	channel_create(&chunk_result_queue, sizeof(struct chunk_result_packet), CHUNKS_PER_DIM * CHUNKS_PER_DIM);
-	ht_setup(&chunk_block_queue, sizeof(struct chunk*), sizeof(struct chunk_result_packet), 64);
+	ht_setup(&chunk_block_queue, sizeof(struct chunk*), sizeof(struct chunk_work_packet), 64);
 
-	pthread_mutex_init(&chunk_block_queue_lock, NULL);
+	pthread_spin_init(&chunk_block_queue_lock, PTHREAD_PROCESS_PRIVATE);
 
 	int chunk_enabled_cores = min(max(window_cpucores() / 2, 1), CHUNK_WORKERS_MAX);
 	log_info("%i cores enabled for chunk generation", chunk_enabled_cores);
@@ -104,11 +108,16 @@ void chunk_render(struct chunk_render_call* c) {
 		matrix_translate(matrix_model, c->mirror_x * map_size_x, 0.0F, c->mirror_y * map_size_z);
 		matrix_upload();
 
-		// glPolygonMode(GL_FRONT, GL_LINE);
+		if(c->chunk->display_list.has_texcoord) {
+			glEnable(GL_TEXTURE_2D);
+			glBindTexture(GL_TEXTURE_2D, texture_blocks.texture_id);
+			glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+		}
 
 		glx_displaylist_draw(&c->chunk->display_list, GLX_DISPLAYLIST_NORMAL);
 
-		// glPolygonMode(GL_FRONT, GL_FILL);
+		if(c->chunk->display_list.has_texcoord)
+			glDisable(GL_TEXTURE_2D);
 
 		matrix_pop(matrix_model);
 	}
@@ -184,13 +193,16 @@ void* chunk_generate(void* data) {
 
 		struct chunk_result_packet result;
 		result.chunk = work.chunk;
+		result.gen = work.chunk->gen;
 		result.minimap_data = malloc(CHUNK_SIZE * CHUNK_SIZE * sizeof(uint32_t));
-		tesselator_create(&result.tesselator, VERTEX_INT, 0);
+		tesselator_create(&result.tesselator, VERTEX_INT, 0, settings.textured_blocks);
 
 		struct libvxl_chunk_copy blocks;
 		map_copy_blocks(&blocks, work.chunk_x * CHUNK_SIZE, work.chunk_y * CHUNK_SIZE);
 
-		if(settings.greedy_meshing)
+		if(settings.textured_blocks) {
+			chunk_generate_textured(&blocks, &result.tesselator, &result.max_height);
+		} else if(settings.greedy_meshing)
 			chunk_generate_greedy(&blocks, work.chunk_x * CHUNK_SIZE, work.chunk_y * CHUNK_SIZE, &result.tesselator,
 								  &result.max_height);
 		else
@@ -560,17 +572,22 @@ void chunk_generate_greedy(struct libvxl_chunk_copy* blocks, size_t start_x, siz
 //-Z = 0.875
 
 // credit: https://0fps.net/2013/07/03/ambient-occlusion-for-minecraft-like-worlds/
-static float vertexAO(int side1, int side2, int corner) {
+static float vertexAO(int side1, int side2, int corner, const float* ao_curve) {
 	if(!side1 && !side2) {
-		return 0.25F;
+		return ao_curve[1];
 	}
 
-	return 0.75F - (!side1 + !side2 + !corner) * 0.25F + 0.25F;
+	return ao_curve[4 - (!side1 + !side2 + !corner)];
 }
 
 void chunk_generate_naive(struct libvxl_chunk_copy* blocks, struct tesselator* tess, int* max_height, int ao) {
 	*max_height = 0;
 	float ao_mult = settings.ao_multiplier > 0.0F ? settings.ao_multiplier : 1.0F;
+	float ao_curve[5];
+	ao_curve[1] = powf(0.25F, ao_mult);
+	ao_curve[2] = powf(0.50F, ao_mult);
+	ao_curve[3] = powf(0.75F, ao_mult);
+	ao_curve[4] = 1.0F;
 
 	for(size_t k = 0; k < blocks->blocks_sorted_count; k++) {
 		struct libvxl_block* blk = blocks->blocks_sorted + k;
@@ -595,23 +612,23 @@ void chunk_generate_naive(struct libvxl_chunk_copy* blocks, struct tesselator* t
 			if(ao) {
 				float A
 					= vertexAO(solid_array_isair(blocks, x - 1, y, z - 1), solid_array_isair(blocks, x, y - 1, z - 1),
-							   solid_array_isair(blocks, x - 1, y - 1, z - 1));
+							   solid_array_isair(blocks, x - 1, y - 1, z - 1), ao_curve);
 				float B
 					= vertexAO(solid_array_isair(blocks, x - 1, y, z - 1), solid_array_isair(blocks, x, y + 1, z - 1),
-							   solid_array_isair(blocks, x - 1, y + 1, z - 1));
+							   solid_array_isair(blocks, x - 1, y + 1, z - 1), ao_curve);
 				float C
 					= vertexAO(solid_array_isair(blocks, x + 1, y, z - 1), solid_array_isair(blocks, x, y + 1, z - 1),
-							   solid_array_isair(blocks, x + 1, y + 1, z - 1));
+							   solid_array_isair(blocks, x + 1, y + 1, z - 1), ao_curve);
 				float D
 					= vertexAO(solid_array_isair(blocks, x + 1, y, z - 1), solid_array_isair(blocks, x, y - 1, z - 1),
-							   solid_array_isair(blocks, x + 1, y - 1, z - 1));
+							   solid_array_isair(blocks, x + 1, y - 1, z - 1), ao_curve);
 
 				tesselator_addi(tess, (int16_t[]) {x, y, z, x, y + 1, z, x + 1, y + 1, z, x + 1, y, z},
 								(uint32_t[]) {
-									rgba(r * 0.875F * powf(A, ao_mult), g * 0.875F * powf(A, ao_mult), b * 0.875F * powf(A, ao_mult), 255),
-									rgba(r * 0.875F * powf(B, ao_mult), g * 0.875F * powf(B, ao_mult), b * 0.875F * powf(B, ao_mult), 255),
-									rgba(r * 0.875F * powf(C, ao_mult), g * 0.875F * powf(C, ao_mult), b * 0.875F * powf(C, ao_mult), 255),
-									rgba(r * 0.875F * powf(D, ao_mult), g * 0.875F * powf(D, ao_mult), b * 0.875F * powf(D, ao_mult), 255),
+									rgba(r * 0.875F * A, g * 0.875F * A, b * 0.875F * A, 255),
+									rgba(r * 0.875F * B, g * 0.875F * B, b * 0.875F * B, 255),
+									rgba(r * 0.875F * C, g * 0.875F * C, b * 0.875F * C, 255),
+									rgba(r * 0.875F * D, g * 0.875F * D, b * 0.875F * D, 255),
 								},
 								NULL);
 			} else {
@@ -624,22 +641,22 @@ void chunk_generate_naive(struct libvxl_chunk_copy* blocks, struct tesselator* t
 			if(ao) {
 				float A
 					= vertexAO(solid_array_isair(blocks, x - 1, y, z + 1), solid_array_isair(blocks, x, y - 1, z + 1),
-							   solid_array_isair(blocks, x - 1, y - 1, z + 1));
+							   solid_array_isair(blocks, x - 1, y - 1, z + 1), ao_curve);
 				float B
 					= vertexAO(solid_array_isair(blocks, x + 1, y, z + 1), solid_array_isair(blocks, x, y - 1, z + 1),
-							   solid_array_isair(blocks, x + 1, y - 1, z + 1));
+							   solid_array_isair(blocks, x + 1, y - 1, z + 1), ao_curve);
 				float C
 					= vertexAO(solid_array_isair(blocks, x + 1, y, z + 1), solid_array_isair(blocks, x, y + 1, z + 1),
-							   solid_array_isair(blocks, x + 1, y + 1, z + 1));
+							   solid_array_isair(blocks, x + 1, y + 1, z + 1), ao_curve);
 				float D
 					= vertexAO(solid_array_isair(blocks, x - 1, y, z + 1), solid_array_isair(blocks, x, y + 1, z + 1),
-							   solid_array_isair(blocks, x - 1, y + 1, z + 1));
+							   solid_array_isair(blocks, x - 1, y + 1, z + 1), ao_curve);
 				tesselator_addi(tess, (int16_t[]) {x, y, z + 1, x + 1, y, z + 1, x + 1, y + 1, z + 1, x, y + 1, z + 1},
 								(uint32_t[]) {
-									rgba(r * 0.625F * powf(A, ao_mult), g * 0.625F * powf(A, ao_mult), b * 0.625F * powf(A, ao_mult), 255),
-									rgba(r * 0.625F * powf(B, ao_mult), g * 0.625F * powf(B, ao_mult), b * 0.625F * powf(B, ao_mult), 255),
-									rgba(r * 0.625F * powf(C, ao_mult), g * 0.625F * powf(C, ao_mult), b * 0.625F * powf(C, ao_mult), 255),
-									rgba(r * 0.625F * powf(D, ao_mult), g * 0.625F * powf(D, ao_mult), b * 0.625F * powf(D, ao_mult), 255),
+									rgba(r * 0.625F * A, g * 0.625F * A, b * 0.625F * A, 255),
+									rgba(r * 0.625F * B, g * 0.625F * B, b * 0.625F * B, 255),
+									rgba(r * 0.625F * C, g * 0.625F * C, b * 0.625F * C, 255),
+									rgba(r * 0.625F * D, g * 0.625F * D, b * 0.625F * D, 255),
 								},
 								NULL);
 			} else {
@@ -652,23 +669,23 @@ void chunk_generate_naive(struct libvxl_chunk_copy* blocks, struct tesselator* t
 			if(ao) {
 				float A
 					= vertexAO(solid_array_isair(blocks, x - 1, y - 1, z), solid_array_isair(blocks, x - 1, y, z - 1),
-							   solid_array_isair(blocks, x - 1, y - 1, z - 1));
+							   solid_array_isair(blocks, x - 1, y - 1, z - 1), ao_curve);
 				float B
 					= vertexAO(solid_array_isair(blocks, x - 1, y - 1, z), solid_array_isair(blocks, x - 1, y, z + 1),
-							   solid_array_isair(blocks, x - 1, y - 1, z + 1));
+							   solid_array_isair(blocks, x - 1, y - 1, z + 1), ao_curve);
 				float C
 					= vertexAO(solid_array_isair(blocks, x - 1, y + 1, z), solid_array_isair(blocks, x - 1, y, z + 1),
-							   solid_array_isair(blocks, x - 1, y + 1, z + 1));
+							   solid_array_isair(blocks, x - 1, y + 1, z + 1), ao_curve);
 				float D
 					= vertexAO(solid_array_isair(blocks, x - 1, y + 1, z), solid_array_isair(blocks, x - 1, y, z - 1),
-							   solid_array_isair(blocks, x - 1, y + 1, z - 1));
+							   solid_array_isair(blocks, x - 1, y + 1, z - 1), ao_curve);
 
 				tesselator_addi(tess, (int16_t[]) {x, y, z, x, y, z + 1, x, y + 1, z + 1, x, y + 1, z},
 								(uint32_t[]) {
-									rgba(r * 0.75F * powf(A, ao_mult), g * 0.75F * powf(A, ao_mult), b * 0.75F * powf(A, ao_mult), 255),
-									rgba(r * 0.75F * powf(B, ao_mult), g * 0.75F * powf(B, ao_mult), b * 0.75F * powf(B, ao_mult), 255),
-									rgba(r * 0.75F * powf(C, ao_mult), g * 0.75F * powf(C, ao_mult), b * 0.75F * powf(C, ao_mult), 255),
-									rgba(r * 0.75F * powf(D, ao_mult), g * 0.75F * powf(D, ao_mult), b * 0.75F * powf(D, ao_mult), 255),
+									rgba(r * 0.75F * A, g * 0.75F * A, b * 0.75F * A, 255),
+									rgba(r * 0.75F * B, g * 0.75F * B, b * 0.75F * B, 255),
+									rgba(r * 0.75F * C, g * 0.75F * C, b * 0.75F * C, 255),
+									rgba(r * 0.75F * D, g * 0.75F * D, b * 0.75F * D, 255),
 								},
 								NULL);
 			} else {
@@ -681,23 +698,23 @@ void chunk_generate_naive(struct libvxl_chunk_copy* blocks, struct tesselator* t
 			if(ao) {
 				float A
 					= vertexAO(solid_array_isair(blocks, x + 1, y - 1, z), solid_array_isair(blocks, x + 1, y, z - 1),
-							   solid_array_isair(blocks, x + 1, y - 1, z - 1));
+							   solid_array_isair(blocks, x + 1, y - 1, z - 1), ao_curve);
 				float B
 					= vertexAO(solid_array_isair(blocks, x + 1, y + 1, z), solid_array_isair(blocks, x + 1, y, z - 1),
-							   solid_array_isair(blocks, x + 1, y + 1, z - 1));
+							   solid_array_isair(blocks, x + 1, y + 1, z - 1), ao_curve);
 				float C
 					= vertexAO(solid_array_isair(blocks, x + 1, y + 1, z), solid_array_isair(blocks, x + 1, y, z + 1),
-							   solid_array_isair(blocks, x + 1, y + 1, z + 1));
+							   solid_array_isair(blocks, x + 1, y + 1, z + 1), ao_curve);
 				float D
 					= vertexAO(solid_array_isair(blocks, x + 1, y - 1, z), solid_array_isair(blocks, x + 1, y, z + 1),
-							   solid_array_isair(blocks, x + 1, y - 1, z + 1));
+							   solid_array_isair(blocks, x + 1, y - 1, z + 1), ao_curve);
 
 				tesselator_addi(tess, (int16_t[]) {x + 1, y, z, x + 1, y + 1, z, x + 1, y + 1, z + 1, x + 1, y, z + 1},
 								(uint32_t[]) {
-									rgba(r * 0.75F * powf(A, ao_mult), g * 0.75F * powf(A, ao_mult), b * 0.75F * powf(A, ao_mult), 255),
-									rgba(r * 0.75F * powf(B, ao_mult), g * 0.75F * powf(B, ao_mult), b * 0.75F * powf(B, ao_mult), 255),
-									rgba(r * 0.75F * powf(C, ao_mult), g * 0.75F * powf(C, ao_mult), b * 0.75F * powf(C, ao_mult), 255),
-									rgba(r * 0.75F * powf(D, ao_mult), g * 0.75F * powf(D, ao_mult), b * 0.75F * powf(D, ao_mult), 255),
+									rgba(r * 0.75F * A, g * 0.75F * A, b * 0.75F * A, 255),
+									rgba(r * 0.75F * B, g * 0.75F * B, b * 0.75F * B, 255),
+									rgba(r * 0.75F * C, g * 0.75F * C, b * 0.75F * C, 255),
+									rgba(r * 0.75F * D, g * 0.75F * D, b * 0.75F * D, 255),
 								},
 								NULL);
 			} else {
@@ -710,23 +727,23 @@ void chunk_generate_naive(struct libvxl_chunk_copy* blocks, struct tesselator* t
 			if(ao) {
 				float A
 					= vertexAO(solid_array_isair(blocks, x - 1, y + 1, z), solid_array_isair(blocks, x, y + 1, z - 1),
-							   solid_array_isair(blocks, x - 1, y + 1, z - 1));
+							   solid_array_isair(blocks, x - 1, y + 1, z - 1), ao_curve);
 				float B
 					= vertexAO(solid_array_isair(blocks, x - 1, y + 1, z), solid_array_isair(blocks, x, y + 1, z + 1),
-							   solid_array_isair(blocks, x - 1, y + 1, z + 1));
+							   solid_array_isair(blocks, x - 1, y + 1, z + 1), ao_curve);
 				float C
 					= vertexAO(solid_array_isair(blocks, x + 1, y + 1, z), solid_array_isair(blocks, x, y + 1, z + 1),
-							   solid_array_isair(blocks, x + 1, y + 1, z + 1));
+							   solid_array_isair(blocks, x + 1, y + 1, z + 1), ao_curve);
 				float D
 					= vertexAO(solid_array_isair(blocks, x + 1, y + 1, z), solid_array_isair(blocks, x, y + 1, z - 1),
-							   solid_array_isair(blocks, x + 1, y + 1, z - 1));
+							   solid_array_isair(blocks, x + 1, y + 1, z - 1), ao_curve);
 
 				tesselator_addi(tess, (int16_t[]) {x, y + 1, z, x, y + 1, z + 1, x + 1, y + 1, z + 1, x + 1, y + 1, z},
 								(uint32_t[]) {
-									rgba(r * powf(A, ao_mult), g * powf(A, ao_mult), b * powf(A, ao_mult), 255),
-									rgba(r * powf(B, ao_mult), g * powf(B, ao_mult), b * powf(B, ao_mult), 255),
-									rgba(r * powf(C, ao_mult), g * powf(C, ao_mult), b * powf(C, ao_mult), 255),
-									rgba(r * powf(D, ao_mult), g * powf(D, ao_mult), b * powf(D, ao_mult), 255),
+									rgba(r * A, g * A, b * A, 255),
+									rgba(r * B, g * B, b * B, 255),
+									rgba(r * C, g * C, b * C, 255),
+									rgba(r * D, g * D, b * D, 255),
 								},
 								NULL);
 			} else {
@@ -739,16 +756,16 @@ void chunk_generate_naive(struct libvxl_chunk_copy* blocks, struct tesselator* t
 			if(ao) {
 				float A
 					= vertexAO(solid_array_isair(blocks, x - 1, y - 1, z), solid_array_isair(blocks, x, y - 1, z - 1),
-							   solid_array_isair(blocks, x - 1, y - 1, z - 1));
+							   solid_array_isair(blocks, x - 1, y - 1, z - 1), ao_curve);
 				float B
 					= vertexAO(solid_array_isair(blocks, x + 1, y - 1, z), solid_array_isair(blocks, x, y - 1, z - 1),
-							   solid_array_isair(blocks, x + 1, y - 1, z - 1));
+							   solid_array_isair(blocks, x + 1, y - 1, z - 1), ao_curve);
 				float C
 					= vertexAO(solid_array_isair(blocks, x + 1, y - 1, z), solid_array_isair(blocks, x, y - 1, z + 1),
-							   solid_array_isair(blocks, x + 1, y - 1, z + 1));
+							   solid_array_isair(blocks, x + 1, y - 1, z + 1), ao_curve);
 				float D
 					= vertexAO(solid_array_isair(blocks, x - 1, y - 1, z), solid_array_isair(blocks, x, y - 1, z + 1),
-							   solid_array_isair(blocks, x - 1, y - 1, z + 1));
+							   solid_array_isair(blocks, x - 1, y - 1, z + 1), ao_curve);
 
 				tesselator_addi(tess, (int16_t[]) {x, y, z, x + 1, y, z, x + 1, y, z + 1, x, y, z + 1},
 								(uint32_t[]) {
@@ -761,6 +778,99 @@ void chunk_generate_naive(struct libvxl_chunk_copy* blocks, struct tesselator* t
 			} else {
 				tesselator_set_color(tess, rgba(r * 0.5F, g * 0.5F, b * 0.5F, 255));
 				tesselator_addi_cube_face(tess, CUBE_FACE_Y_N, x, y, z);
+			}
+		}
+	}
+
+	(*max_height)++;
+}
+
+static void emit_textured_face(struct tesselator* tess, enum tesselator_cube_face face,
+                                int16_t x, int16_t y, int16_t z,
+                                float u0, float v0, float u1, float v1) {
+	switch(face) {
+		case CUBE_FACE_Z_N:
+			tesselator_addi_uv(tess, (int16_t[]){x, y, z, x, y+1, z, x+1, y+1, z, x+1, y, z},
+							   (float[]){u0, v1, u0, v0, u1, v0, u1, v1});
+			break;
+		case CUBE_FACE_Z_P:
+			tesselator_addi_uv(tess, (int16_t[]){x, y, z+1, x+1, y, z+1, x+1, y+1, z+1, x, y+1, z+1},
+							   (float[]){u0, v1, u1, v1, u1, v0, u0, v0});
+			break;
+		case CUBE_FACE_X_N:
+			tesselator_addi_uv(tess, (int16_t[]){x, y, z, x, y, z+1, x, y+1, z+1, x, y+1, z},
+							   (float[]){u0, v1, u1, v1, u1, v0, u0, v0});
+			break;
+		case CUBE_FACE_X_P:
+			tesselator_addi_uv(tess, (int16_t[]){x+1, y, z, x+1, y+1, z, x+1, y+1, z+1, x+1, y, z+1},
+							   (float[]){u0, v1, u0, v0, u1, v0, u1, v1});
+			break;
+		case CUBE_FACE_Y_P:
+			tesselator_addi_uv(tess, (int16_t[]){x, y+1, z, x, y+1, z+1, x+1, y+1, z+1, x+1, y+1, z},
+							   (float[]){u0, v0, u0, v1, u1, v1, u1, v0});
+			break;
+		case CUBE_FACE_Y_N:
+			tesselator_addi_uv(tess, (int16_t[]){x, y, z, x+1, y, z, x+1, y, z+1, x, y, z+1},
+							   (float[]){u0, v0, u1, v0, u1, v1, u0, v1});
+			break;
+	}
+}
+
+void chunk_generate_textured(struct libvxl_chunk_copy* blocks, struct tesselator* tess, int* max_height) {
+	*max_height = 0;
+
+	for(size_t k = 0; k < blocks->blocks_sorted_count; k++) {
+		struct libvxl_block* blk = blocks->blocks_sorted + k;
+
+		int x = key_getx(blk->position);
+		int y = map_size_y - 1 - key_getz(blk->position);
+		int z = key_gety(blk->position);
+
+		*max_height = max(*max_height, y);
+
+		uint32_t col = blk->color;
+		int r = blue(col);
+		int g = green(col);
+		int b = red(col);
+
+		{
+			int tile_x = (r / 64) + ((b / 64 == 1 || b / 64 == 3) ? 4 : 0);
+			int tile_y = (g / 64) + ((b / 64 == 2 || b / 64 == 3) ? 4 : 0);
+			tile_x = min(tile_x, 7);
+			tile_y = min(tile_y, 7);
+			float u0 = tile_x / 8.0f;
+			float v0 = tile_y / 8.0f;
+			float u1 = (tile_x + 1) / 8.0f;
+			float v1 = (tile_y + 1) / 8.0f;
+
+			if(solid_array_isair(blocks, x, y, z - 1)) {
+				tesselator_set_color(tess, rgba(r * 0.875F, g * 0.875F, b * 0.875F, 255));
+				emit_textured_face(tess, CUBE_FACE_Z_N, x, y, z, u0, v0, u1, v1);
+			}
+
+			if(solid_array_isair(blocks, x, y, z + 1)) {
+				tesselator_set_color(tess, rgba(r * 0.625F, g * 0.625F, b * 0.625F, 255));
+				emit_textured_face(tess, CUBE_FACE_Z_P, x, y, z, u0, v0, u1, v1);
+			}
+
+			if(solid_array_isair(blocks, x - 1, y, z)) {
+				tesselator_set_color(tess, rgba(r * 0.75F, g * 0.75F, b * 0.75F, 255));
+				emit_textured_face(tess, CUBE_FACE_X_N, x, y, z, u0, v0, u1, v1);
+			}
+
+			if(solid_array_isair(blocks, x + 1, y, z)) {
+				tesselator_set_color(tess, rgba(r * 0.75F, g * 0.75F, b * 0.75F, 255));
+				emit_textured_face(tess, CUBE_FACE_X_P, x, y, z, u0, v0, u1, v1);
+			}
+
+			if(y == map_size_y - 1 || solid_array_isair(blocks, x, y + 1, z)) {
+				tesselator_set_color(tess, rgba(r, g, b, 255));
+				emit_textured_face(tess, CUBE_FACE_Y_P, x, y, z, u0, v0, u1, v1);
+			}
+
+			if(y > 0 && solid_array_isair(blocks, x, y - 1, z)) {
+				tesselator_set_color(tess, rgba(r * 0.5F, g * 0.5F, b * 0.5F, 255));
+				emit_textured_face(tess, CUBE_FACE_Y_N, x, y, z, u0, v0, u1, v1);
 			}
 		}
 	}
@@ -782,7 +892,7 @@ void chunk_update_all() {
 		struct chunk_result_packet* result = results + drain - 1;
 
 		for(size_t k = 0; k < drain; k++, result--) {
-			if(!result->chunk->updated) {
+			if(!result->chunk->updated && result->gen == result->chunk->gen) {
 				result->chunk->updated = true;
 
 				if(!result->chunk->created) {
@@ -808,6 +918,11 @@ void chunk_update_all() {
 
 void chunk_rebuild_all() {
 	channel_clear(&chunk_work_queue);
+	chunk_gen++;
+
+	for(int k = 0; k < CHUNKS_PER_DIM; k++)
+		for(int i = 0; i < CHUNKS_PER_DIM; i++)
+			chunks[i + k * CHUNKS_PER_DIM].gen = chunk_gen;
 
 	for(int k = CHUNKS_PER_DIM / 2; k >= 0; k--) {
 		for(int i = k; i < CHUNKS_PER_DIM - k; i++) {
@@ -833,14 +948,14 @@ void chunk_rebuild_all() {
 void chunk_block_update(int x, int y, int z) {
 	struct chunk* c = chunks + (x / CHUNK_SIZE) + (z / CHUNK_SIZE) * CHUNKS_PER_DIM;
 
-	pthread_mutex_lock(&chunk_block_queue_lock);
+	pthread_spin_lock(&chunk_block_queue_lock);
 	ht_insert(&chunk_block_queue, &c,
 			  &(struct chunk_work_packet) {
 				  .chunk = c,
 				  .chunk_x = c->x,
 				  .chunk_y = c->y,
 			  });
-	pthread_mutex_unlock(&chunk_block_queue_lock);
+	pthread_spin_unlock(&chunk_block_queue_lock);
 }
 
 static bool iterate_chunk_updates(void* key, void* value, void* user) {
@@ -850,8 +965,8 @@ static bool iterate_chunk_updates(void* key, void* value, void* user) {
 }
 
 void chunk_queue_blocks() {
-	pthread_mutex_lock(&chunk_block_queue_lock);
+	pthread_spin_lock(&chunk_block_queue_lock);
 	ht_iterate(&chunk_block_queue, NULL, iterate_chunk_updates);
 	ht_clear(&chunk_block_queue);
-	pthread_mutex_unlock(&chunk_block_queue_lock);
+	pthread_spin_unlock(&chunk_block_queue_lock);
 }

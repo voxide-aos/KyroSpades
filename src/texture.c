@@ -40,6 +40,7 @@ struct texture texture_dummy;
 
 struct texture texture_health;
 struct texture texture_block;
+struct texture texture_blocks;
 struct texture texture_grenade;
 struct texture texture_ammo_semi;
 struct texture texture_ammo_smg;
@@ -138,6 +139,8 @@ int texture_create(struct texture* t, char* filename) {
 		return 0;
 	}
 
+	log_debug("Loaded texture: %s (%ix%i)", filename, t->width, t->height);
+
 	texture_resize_pow2(t, 0);
 
 	glGenTextures(1, &t->texture_id);
@@ -148,6 +151,7 @@ int texture_create(struct texture* t, char* filename) {
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 	glBindTexture(GL_TEXTURE_2D, 0);
+	return 1;
 }
 
 int texture_create_buffer(struct texture* t, int width, int height, unsigned char* buff, int new) {
@@ -165,6 +169,7 @@ int texture_create_buffer(struct texture* t, int width, int height, unsigned cha
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 	glBindTexture(GL_TEXTURE_2D, 0);
+	return 1;
 }
 
 void texture_delete(struct texture* t) {
@@ -412,6 +417,11 @@ void texture_init() {
 
 	texture_create(&texture_health, "png/health.png");
 	texture_create(&texture_block, "png/block.png");
+	texture_create(&texture_blocks, "png/multimapblock.png");
+	glBindTexture(GL_TEXTURE_2D, texture_blocks.texture_id);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
 	texture_create(&texture_grenade, "png/grenade.png");
 	texture_create(&texture_ammo_semi, "png/semiammo.png");
 	texture_create(&texture_ammo_smg, "png/smgammo.png");

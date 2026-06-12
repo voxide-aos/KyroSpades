@@ -37,9 +37,41 @@
 #include <unistd.h>
 #endif
 
+#ifdef OS_APPLE
+#include <unistd.h>
+#endif
+
 #ifdef OS_HAIKU
 #include <kernel/OS.h>
 #endif
+
+/* Names for keys whose backend key-name API can't resolve them (arrows and
+   other non-printable keys).  Keyed on the internal WINDOW_KEY_* enum so it
+   is independent of the SDL/GLFW backend. */
+static const char* window_internal_keyname(int internal) {
+	switch(internal) {
+		case WINDOW_KEY_CURSOR_LEFT:
+		case WINDOW_KEY_LEFT:            return "Left Arrow";
+		case WINDOW_KEY_CURSOR_RIGHT:
+		case WINDOW_KEY_RIGHT:           return "Right Arrow";
+		case WINDOW_KEY_CURSOR_UP:
+		case WINDOW_KEY_UP:              return "Up Arrow";
+		case WINDOW_KEY_CURSOR_DOWN:
+		case WINDOW_KEY_DOWN:            return "Down Arrow";
+		case WINDOW_KEY_DEMO_SEEK_BACK:  return "Left Arrow";
+		case WINDOW_KEY_DEMO_SEEK_FWD:   return "Right Arrow";
+		case WINDOW_KEY_DEMO_SPEED_DOWN: return "-";
+		case WINDOW_KEY_DEMO_SPEED_UP:   return "=";
+		default:                         return NULL;
+	}
+}
+
+static int window_pending_apply = 0;
+static int pending_multisamples;
+static int pending_vsync;
+static int pending_fullscreen;
+static int pending_width;
+static int pending_height;
 
 #ifdef USE_GLFW
 
@@ -152,28 +184,22 @@ static void window_impl_keys(GLFWwindow* window, int key, int scancode, int acti
 	}
 }
 
-/* Names for keys whose backend key-name API can't resolve them (arrows and
-   other non-printable keys).  Keyed on the internal WINDOW_KEY_* enum so it
-   is independent of the SDL/GLFW backend.  Returns NULL if not handled. */
-static const char* window_internal_keyname(int internal) {
-	switch(internal) {
-		case WINDOW_KEY_CURSOR_LEFT:
-		case WINDOW_KEY_LEFT:            return "Left Arrow";
-		case WINDOW_KEY_CURSOR_RIGHT:
-		case WINDOW_KEY_RIGHT:           return "Right Arrow";
-		case WINDOW_KEY_CURSOR_UP:
-		case WINDOW_KEY_UP:              return "Up Arrow";
-		case WINDOW_KEY_CURSOR_DOWN:
-		case WINDOW_KEY_DOWN:            return "Down Arrow";
-		case WINDOW_KEY_DEMO_SEEK_BACK:  return "Left Arrow";
-		case WINDOW_KEY_DEMO_SEEK_FWD:   return "Right Arrow";
-		case WINDOW_KEY_DEMO_SPEED_DOWN: return "-";
-		case WINDOW_KEY_DEMO_SPEED_UP:   return "=";
-		default:                         return NULL;
-	}
-}
-
 void window_keyname(int keycode, char* output, size_t length) {
+#ifdef OS_WINDOWS
+	if(glfwGetKeyScancode(keycode) > 0) {
+		GetKeyNameTextA(glfwGetKeyScancode(keycode) << 16, output, length);
+		if(output[0] && strcmp(output, "?")) return;
+	}
+#else
+	const char* name = glfwGetKeyName(keycode, 0);
+	if(name && *name) {
+		strncpy(output, name, length);
+		output[length - 1] = 0;
+		return;
+	}
+#endif
+	/* Backend couldn't name it — fall back to our internal key labels for
+	   non-printable keys (arrows, demo controls, etc.). */
 	{
 		int results[8];
 		int count = config_key_translate(keycode, 0, results);
@@ -182,19 +208,7 @@ void window_keyname(int keycode, char* output, size_t length) {
 			if(fb) { strncpy(output, fb, length); output[length - 1] = 0; return; }
 		}
 	}
-#ifdef OS_WINDOWS
-	GetKeyNameTextA(glfwGetKeyScancode(keycode) << 16, output, length);
-#else
-	const char* name = glfwGetKeyName(keycode, 0);
-
-	if(name) {
-		strncpy(output, name, length);
-		output[length - 1] = 0;
-	} else {
-		if(length >= 2)
-			strcpy(output, "?");
-	}
-#endif
+	if(length >= 2) strcpy(output, "?");
 }
 
 float window_time() {
@@ -281,8 +295,6 @@ void window_init() {
 		exit(1);
 	}
 
-	glfwSetJoystickCallback(window_impl_joystick);
-
 	if(settings.multisamples > 0) {
 		glfwWindowHint(GLFW_SAMPLES, settings.multisamples);
 	}
@@ -316,28 +328,40 @@ void window_init() {
 	glfwSetMouseButtonCallback(hud_window->impl, window_impl_mouseclick);
 	glfwSetScrollCallback(hud_window->impl, window_impl_mousescroll);
 	glfwSetCharCallback(hud_window->impl, window_impl_textinput);
+	glfwSetJoystickCallback(window_impl_joystick);
 
 	if(!settings.disable_raw_input && glfwRawMouseMotionSupported())
 		glfwSetInputMode(hud_window->impl, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
 }
 
 void window_fromsettings() {
-	glfwWindowHint(GLFW_SAMPLES, settings.multisamples);
-	glfwSetWindowSize(hud_window->impl, settings.window_width, settings.window_height);
+	pending_multisamples = settings.multisamples;
+	pending_vsync = settings.vsync;
+	pending_fullscreen = settings.fullscreen;
+	pending_width = settings.window_width;
+	pending_height = settings.window_height;
+	window_pending_apply = 1;
+}
 
-	if(settings.vsync < 2)
-		window_swapping(settings.vsync);
-	if(settings.vsync > 1)
+void window_apply() {
+	if(!window_pending_apply) return;
+	window_pending_apply = 0;
+
+	glfwWindowHint(GLFW_SAMPLES, pending_multisamples);
+
+	if(pending_vsync < 2)
+		window_swapping(pending_vsync);
+	if(pending_vsync > 1)
 		window_swapping(0);
 
 	const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
-	if(settings.fullscreen)
-		glfwSetWindowMonitor(hud_window->impl, glfwGetPrimaryMonitor(), 0, 0, settings.window_width,
-							 settings.window_height, mode->refreshRate);
-	else
-		glfwSetWindowMonitor(hud_window->impl, NULL, (mode->width - settings.window_width) / 2,
-							 (mode->height - settings.window_height) / 2, settings.window_width, settings.window_height,
-							 0);
+	if(pending_fullscreen) {
+		glfwSetWindowMonitor(hud_window->impl, glfwGetPrimaryMonitor(), 0, 0,
+							 mode->width, mode->height, mode->refreshRate);
+	} else {
+		glfwSetWindowMonitor(hud_window->impl, NULL, (mode->width - pending_width) / 2,
+							 (mode->height - pending_height) / 2, pending_width, pending_height, 0);
+	}
 }
 
 void window_deinit() {
@@ -359,7 +383,7 @@ static void gamepad_translate_key(GLFWgamepadstate* state, GLFWgamepadstate* old
 }
 
 static void gamepad_translate_button(GLFWgamepadstate* state, GLFWgamepadstate* old, int gamepad,
-									 enum window_buttons button) {
+									   enum window_buttons button) {
 	if(!old->buttons[gamepad] && state->buttons[gamepad]) {
 		mouse_click(hud_window, button, WINDOW_PRESS, 0);
 	} else if(old->buttons[gamepad] && !state->buttons[gamepad]) {
@@ -419,20 +443,42 @@ void window_textinput(int allow) {
 }
 
 void window_fromsettings() {
-	SDL_SetWindowSize(hud_window->impl, settings.window_width, settings.window_height);
+	pending_multisamples = settings.multisamples;
+	pending_vsync = settings.vsync;
+	pending_fullscreen = settings.fullscreen;
+	pending_width = settings.window_width;
+	pending_height = settings.window_height;
+	window_pending_apply = 1;
+}
 
-	if(settings.vsync < 2)
-		window_swapping(settings.vsync);
-	if(settings.vsync > 1)
+void window_apply() {
+	if(!window_pending_apply) return;
+	window_pending_apply = 0;
+
+	if(pending_vsync < 2)
+		window_swapping(pending_vsync);
+	if(pending_vsync > 1)
 		window_swapping(0);
 
-	if(settings.fullscreen)
+	if(pending_fullscreen) {
 		SDL_SetWindowFullscreen(hud_window->impl, SDL_WINDOW_FULLSCREEN);
-	else
+	} else {
 		SDL_SetWindowFullscreen(hud_window->impl, 0);
+		SDL_SetWindowSize(hud_window->impl, pending_width, pending_height);
+	}
 }
 
 void window_keyname(int keycode, char* output, size_t length) {
+	/* Ask SDL first — it knows the human name for every printable key, plus
+	   named non-printables ("Left", "Right", "Escape", etc.).  Only fall back
+	   to our internal labels when SDL genuinely can't help. */
+	const char* nm = SDL_GetKeyName(keycode);
+	if(nm && *nm && strcmp(nm, "Unknown Key")) {
+		strncpy(output, nm, length);
+		output[length - 1] = 0;
+		return;
+	}
+	/* Last resort: our label table for keys SDL can't name. */
 	{
 		int results[8];
 		int count = config_key_translate(keycode, 0, results);
@@ -441,10 +487,7 @@ void window_keyname(int keycode, char* output, size_t length) {
 			if(fb) { strncpy(output, fb, length); output[length - 1] = 0; return; }
 		}
 	}
-	const char* nm = SDL_GetKeyName(keycode);
-	if(!nm || !*nm) nm = "?";
-	strncpy(output, nm, length);
-	output[length - 1] = 0;
+	if(length >= 2) strcpy(output, "?");
 }
 
 float window_time() {
@@ -484,8 +527,10 @@ void window_cursor_hand(int on) {
 		window_hand_cursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_HAND);
 	SDL_SetCursor(on ? window_hand_cursor : SDL_GetDefaultCursor());
 }
+void window_mousemode(int mode) {
+	int s = SDL_GetRelativeMouseMode();
 	if((s && mode == WINDOW_CURSOR_ENABLED) || (!s && mode == WINDOW_CURSOR_DISABLED))
-		SDL_SetRelativeMouseMode(mode == WINDOW_CURSOR_ENABLED ? 0 : 1);
+		SDL_SetRelativeMouseMode(mode == WINDOW_CURSOR_ENABLED ? SDL_FALSE : SDL_TRUE);
 }
 
 static double mx = -1, my = -1;
@@ -512,6 +557,25 @@ void window_swapping(int value) {
 }
 
 static struct window_finger fingers[8];
+
+static void window_dispatch_key(int sym, int action, int mod) {
+	int count = config_key_translate(sym, 0, NULL);
+
+	if(count > 0) {
+		int results[count];
+		config_key_translate(sym, 0, results);
+
+		for(int k = 0; k < count; k++) {
+			keys(hud_window, results[k], sym, action, mod);
+
+			if(hud_active->input_keyboard)
+				hud_active->input_keyboard(results[k], action, mod, sym);
+		}
+	} else {
+		if(hud_active->input_keyboard)
+			hud_active->input_keyboard(WINDOW_KEY_UNKNOWN, action, mod, sym);
+	}
+}
 
 void window_init() {
 	static struct window_instance i;
@@ -554,50 +618,14 @@ void window_update() {
 	while(SDL_PollEvent(&event)) {
 		switch(event.type) {
 			case SDL_QUIT: quit = 1; break;
-			case SDL_KEYDOWN: {
-				int count = config_key_translate(event.key.keysym.sym, 0, NULL);
-
-				if(count > 0) {
-					int results[count];
-					config_key_translate(event.key.keysym.sym, 0, results);
-
-					for(int k = 0; k < count; k++) {
-						keys(hud_window, results[k], event.key.keysym.sym, WINDOW_PRESS,
-							 event.key.keysym.mod & (KMOD_CTRL | KMOD_GUI));
-
-						if(hud_active->input_keyboard)
-							hud_active->input_keyboard(results[k], WINDOW_PRESS, event.key.keysym.mod & (KMOD_CTRL | KMOD_GUI),
-													   event.key.keysym.sym);
-					}
-				} else {
-					if(hud_active->input_keyboard)
-						hud_active->input_keyboard(WINDOW_KEY_UNKNOWN, WINDOW_PRESS, event.key.keysym.mod & (KMOD_CTRL | KMOD_GUI),
-												   event.key.keysym.sym);
-				}
+			case SDL_KEYDOWN:
+				window_dispatch_key(event.key.keysym.sym, WINDOW_PRESS,
+									 event.key.keysym.mod & (KMOD_CTRL | KMOD_GUI));
 				break;
-			}
-			case SDL_KEYUP: {
-				int count = config_key_translate(event.key.keysym.sym, 0, NULL);
-
-				if(count > 0) {
-					int results[count];
-					config_key_translate(event.key.keysym.sym, 0, results);
-
-					for(int k = 0; k < count; k++) {
-						keys(hud_window, results[k], event.key.keysym.sym, WINDOW_RELEASE,
-							 event.key.keysym.mod & (KMOD_CTRL | KMOD_GUI));
-
-						if(hud_active->input_keyboard)
-							hud_active->input_keyboard(results[k], WINDOW_RELEASE, event.key.keysym.mod & (KMOD_CTRL | KMOD_GUI),
-													   event.key.keysym.sym);
-					}
-				} else {
-					if(hud_active->input_keyboard)
-						hud_active->input_keyboard(WINDOW_KEY_UNKNOWN, WINDOW_RELEASE, event.key.keysym.mod & (KMOD_CTRL | KMOD_GUI),
-												   event.key.keysym.sym);
-				}
+			case SDL_KEYUP:
+				window_dispatch_key(event.key.keysym.sym, WINDOW_RELEASE,
+									 event.key.keysym.mod & (KMOD_CTRL | KMOD_GUI));
 				break;
-			}
 			case SDL_MOUSEBUTTONDOWN: {
 				int a = 0;
 				switch(event.button.button) {

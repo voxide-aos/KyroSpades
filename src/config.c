@@ -19,7 +19,7 @@
 
 #include <stdlib.h>
 #include <float.h>
-#include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <limits.h>
 #include <math.h>
@@ -38,6 +38,192 @@ struct list config_keys;
 struct list config_settings;
 
 struct list config_file;
+
+#ifdef USE_SDL
+#define CONFIG_BACKEND "sdl"
+#else
+#define CONFIG_BACKEND "glfw"
+#endif
+
+/* Backend that wrote the config file currently being parsed.  Defaults to
+   "glfw" because pre-backend-tag config files were all written by GLFW
+   builds. */
+static char config_file_backend[8] = "glfw";
+
+/* Tracks, by index into config_keys, whether a control binding was read from a
+   symbolic key name rather than a raw integer.  Name-resolved bindings already
+   hold the current backend's key code, so the legacy integer migration pass
+   below must leave them untouched.  Sized well above the number of registered
+   keys; entries past the cap simply fall through to the (safe) integer path. */
+#define CONFIG_KEYS_MAX 256
+static unsigned char config_key_named[CONFIG_KEYS_MAX];
+
+#ifdef USE_SDL
+/* Map a raw GLFW key code (as found in a legacy config.ini written by a GLFW
+   build) to the equivalent SDL keysym.  Only used when migrating a GLFW config
+   into an SDL build.  Covers every key bound by default in config_reload();
+   unknown codes are returned unchanged and reported by the caller. */
+static int config_glfw_to_sdl(int code) {
+	switch(code) {
+		case 32:  return SDLK_SPACE;
+		case 44:  return SDLK_COMMA;
+		case 45:  return SDLK_MINUS;
+		case 46:  return SDLK_PERIOD;
+		case 47:  return SDLK_SLASH;
+		case 49:  return SDLK_1;
+		case 50:  return SDLK_2;
+		case 51:  return SDLK_3;
+		case 52:  return SDLK_4;
+		case 61:  return SDLK_EQUALS;
+		case 65:  return SDLK_a;
+		case 67:  return SDLK_c;
+		case 68:  return SDLK_d;
+		case 69:  return SDLK_e;
+		case 77:  return SDLK_m;
+		case 78:  return SDLK_n;
+		case 80:  return SDLK_p;
+		case 81:  return SDLK_q;
+		case 82:  return SDLK_r;
+		case 83:  return SDLK_s;
+		case 84:  return SDLK_t;
+		case 86:  return SDLK_v;
+		case 87:  return SDLK_w;
+		case 89:  return SDLK_y;
+		case 90:  return SDLK_z;
+		case 256: return SDLK_ESCAPE;
+		case 257: return SDLK_RETURN;
+		case 258: return SDLK_TAB;
+		case 259: return SDLK_BACKSPACE;
+		case 262: return SDLK_RIGHT;
+		case 263: return SDLK_LEFT;
+		case 264: return SDLK_DOWN;
+		case 265: return SDLK_UP;
+		case 290: return SDLK_F1;
+		case 291: return SDLK_F2;
+		case 292: return SDLK_F3;
+		case 293: return SDLK_F4;
+		case 294: return SDLK_F5;
+		case 295: return SDLK_F6;
+		case 298: return SDLK_F9;
+		case 300: return SDLK_F11;
+		case 301: return SDLK_F12;
+		case 333: return SDLK_KP_MINUS;
+		case 334: return SDLK_KP_PLUS;
+		case 340: return SDLK_LSHIFT;
+		case 341: return SDLK_LCTRL;
+		default:  return code;
+	}
+}
+#endif
+
+/* Human-readable key names written to / read from config.ini, replacing the
+   old raw integer key codes.  This is the single source of truth for both
+   backends: each row pairs a token with its GLFW and SDL symbol suffix, and the
+   macro below selects the column for whichever backend is being compiled (only
+   that backend's headers are present, so only its column is ever referenced).
+   Because the tokens match across backends, a config written on one backend is
+   also understood by the other — moving config.ini between a GLFW machine and
+   an SDL one "just works".  Format:  KEY(token, GLFW suffix, SDL suffix). */
+#define CONFIG_KEY_NAMES(KEY)                                  \
+	KEY("a", A, a) KEY("b", B, b) KEY("c", C, c) KEY("d", D, d) \
+	KEY("e", E, e) KEY("f", F, f) KEY("g", G, g) KEY("h", H, h) \
+	KEY("i", I, i) KEY("j", J, j) KEY("k", K, k) KEY("l", L, l) \
+	KEY("m", M, m) KEY("n", N, n) KEY("o", O, o) KEY("p", P, p) \
+	KEY("q", Q, q) KEY("r", R, r) KEY("s", S, s) KEY("t", T, t) \
+	KEY("u", U, u) KEY("v", V, v) KEY("w", W, w) KEY("x", X, x) \
+	KEY("y", Y, y) KEY("z", Z, z)                               \
+	KEY("0", 0, 0) KEY("1", 1, 1) KEY("2", 2, 2) KEY("3", 3, 3) \
+	KEY("4", 4, 4) KEY("5", 5, 5) KEY("6", 6, 6) KEY("7", 7, 7) \
+	KEY("8", 8, 8) KEY("9", 9, 9)                               \
+	KEY("f1", F1, F1)   KEY("f2", F2, F2)   KEY("f3", F3, F3)   \
+	KEY("f4", F4, F4)   KEY("f5", F5, F5)   KEY("f6", F6, F6)   \
+	KEY("f7", F7, F7)   KEY("f8", F8, F8)   KEY("f9", F9, F9)   \
+	KEY("f10", F10, F10) KEY("f11", F11, F11) KEY("f12", F12, F12) \
+	KEY("space", SPACE, SPACE)                                 \
+	KEY("escape", ESCAPE, ESCAPE)                              \
+	KEY("enter", ENTER, RETURN)                                \
+	KEY("tab", TAB, TAB)                                       \
+	KEY("backspace", BACKSPACE, BACKSPACE)                     \
+	KEY("delete", DELETE, DELETE)                              \
+	KEY("insert", INSERT, INSERT)                              \
+	KEY("home", HOME, HOME) KEY("end", END, END)               \
+	KEY("page_up", PAGE_UP, PAGEUP)                            \
+	KEY("page_down", PAGE_DOWN, PAGEDOWN)                      \
+	KEY("left", LEFT, LEFT)   KEY("right", RIGHT, RIGHT)       \
+	KEY("up", UP, UP)         KEY("down", DOWN, DOWN)          \
+	KEY("left_shift", LEFT_SHIFT, LSHIFT)                      \
+	KEY("right_shift", RIGHT_SHIFT, RSHIFT)                    \
+	KEY("left_control", LEFT_CONTROL, LCTRL)                   \
+	KEY("right_control", RIGHT_CONTROL, RCTRL)                 \
+	KEY("left_alt", LEFT_ALT, LALT)                            \
+	KEY("right_alt", RIGHT_ALT, RALT)                          \
+	KEY("left_super", LEFT_SUPER, LGUI)                        \
+	KEY("right_super", RIGHT_SUPER, RGUI)                      \
+	KEY("caps_lock", CAPS_LOCK, CAPSLOCK)                      \
+	KEY("comma", COMMA, COMMA)                                 \
+	KEY("period", PERIOD, PERIOD)                              \
+	KEY("slash", SLASH, SLASH)                                 \
+	KEY("minus", MINUS, MINUS)                                 \
+	KEY("equals", EQUAL, EQUALS)                               \
+	KEY("semicolon", SEMICOLON, SEMICOLON)                     \
+	KEY("apostrophe", APOSTROPHE, QUOTE)                       \
+	KEY("grave", GRAVE_ACCENT, BACKQUOTE)                      \
+	KEY("left_bracket", LEFT_BRACKET, LEFTBRACKET)             \
+	KEY("right_bracket", RIGHT_BRACKET, RIGHTBRACKET)          \
+	KEY("backslash", BACKSLASH, BACKSLASH)                     \
+	KEY("kp_0", KP_0, KP_0) KEY("kp_1", KP_1, KP_1)            \
+	KEY("kp_2", KP_2, KP_2) KEY("kp_3", KP_3, KP_3)            \
+	KEY("kp_4", KP_4, KP_4) KEY("kp_5", KP_5, KP_5)            \
+	KEY("kp_6", KP_6, KP_6) KEY("kp_7", KP_7, KP_7)            \
+	KEY("kp_8", KP_8, KP_8) KEY("kp_9", KP_9, KP_9)            \
+	KEY("kp_add", KP_ADD, KP_PLUS)                             \
+	KEY("kp_subtract", KP_SUBTRACT, KP_MINUS)                  \
+	KEY("kp_multiply", KP_MULTIPLY, KP_MULTIPLY)               \
+	KEY("kp_divide", KP_DIVIDE, KP_DIVIDE)                     \
+	KEY("kp_enter", KP_ENTER, KP_ENTER)                        \
+	KEY("kp_decimal", KP_DECIMAL, KP_PERIOD)
+
+#ifdef USE_SDL
+#define CONFIG_KEY_ROW(tok, g, s) { tok, SDLK_##s },
+#else
+#define CONFIG_KEY_ROW(tok, g, s) { tok, GLFW_KEY_##g },
+#endif
+
+static const struct {
+	const char* name;
+	int code;
+} config_key_table[] = {
+	CONFIG_KEY_NAMES(CONFIG_KEY_ROW)
+};
+
+#undef CONFIG_KEY_ROW
+
+#define CONFIG_KEY_TABLE_LEN ((int)(sizeof(config_key_table) / sizeof(config_key_table[0])))
+
+/* Symbolic key name (e.g. "w", "left_shift") -> current backend key code, or
+   -1 if the token is not a known name.  Case-insensitive. */
+static int config_keyname_to_code(const char* name) {
+	for(int i = 0; i < CONFIG_KEY_TABLE_LEN; i++) {
+		const char* a = config_key_table[i].name;
+		const char* b = name;
+		while(*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) {
+			a++;
+			b++;
+		}
+		if(*a == 0 && *b == 0)
+			return config_key_table[i].code;
+	}
+	return -1;
+}
+
+/* Current backend key code -> canonical symbolic name, or NULL if the code has
+   no name (the binding is then saved as a raw integer to avoid losing it). */
+static const char* config_keyname_from_code(int code) {
+	for(int i = 0; i < CONFIG_KEY_TABLE_LEN; i++)
+		if(config_key_table[i].code == code)
+			return config_key_table[i].name;
+	return NULL;
+}
 
 #define IMPORT_SETTING(key, ini, _value)        \
     if(!strcmp(name, #ini)) {                   \
@@ -120,6 +306,7 @@ void config_save() {
 	config_seti("client", "chat_mention_b", settings.chat_mention_b);
 	config_setf("client", "spectator_speed", settings.spectator_speed);
 	config_setf("client", "spectator_acceleration", settings.spectator_acceleration);
+	config_setf("client", "spectator_fog_distance", settings.spectator_fog_distance);
 	config_seti("client", "iron_sight", settings.iron_sight);
 	config_seti("client", "gmi", settings.gmi);
 	config_seti("client", "disable_raw_input", settings.disable_raw_input);
@@ -129,17 +316,39 @@ void config_save() {
 	config_seti("client", "show_live_player_count", settings.show_live_player_count);
 	config_seti("client", "ads_zoom_animation", settings.ads_zoom_animation);
 	config_seti("client", "auto_demo_recording", settings.auto_demo_recording);
+	config_seti("client", "player_stats", settings.player_stats);
+	config_seti("client", "player_technical_stats", settings.player_technical_stats);
 	config_seti("client", "rain", settings.rain);
 	config_seti("client", "snow", settings.snow);
-	config_seti("client", "snow_3d", settings.snow_3d);
+	config_seti("client", "rain_snow_3d", settings.rain_snow_3d);
 	config_setf("client", "rifle_ads_fov", settings.rifle_ads_fov);
 	config_setf("client", "shotgun_ads_fov", settings.shotgun_ads_fov);
 	config_setf("client", "smg_ads_fov", settings.smg_ads_fov);
+	config_seti("client", "disable_corpse_despawn", settings.disable_corpse_despawn);
+	config_seti("client", "disable_dynamic_fov", settings.disable_dynamic_fov);
+	config_seti("client", "textured_blocks", settings.textured_blocks);
+	config_seti("client", "minimap_zoom", settings.minimap_zoom);
+	config_seti("client", "skin_spade", settings.skin_spade);
+	config_seti("client", "skin_grenade", settings.skin_grenade);
+	config_seti("client", "skin_rifle", settings.skin_rifle);
+	config_seti("client", "skin_smg", settings.skin_smg);
+	config_seti("client", "skin_shotgun", settings.skin_shotgun);
+	config_seti("client", "skin_player", settings.skin_player);
+	config_seti("client", "skin_intel", settings.skin_intel);
+	config_seti("client", "skin_tent", settings.skin_tent);
+	config_seti("client", "debug_log", settings.debug_log);
+
+	config_sets("meta", "backend", CONFIG_BACKEND);
 
 	for(int k = 0; k < list_size(&config_keys); k++) {
 		struct config_key_pair* e = list_get(&config_keys, k);
-		if(strlen(e->name) > 0)
-			config_seti("controls", e->name, e->def);
+		if(strlen(e->name) > 0) {
+			const char* kn = config_keyname_from_code(e->def);
+			if(kn)
+				config_sets("controls", e->name, kn);
+			else
+				config_seti("controls", e->name, e->def); /* exotic key: keep raw code */
+		}
 	}
 
 	void* f = file_open("config.ini", "w");
@@ -200,6 +409,7 @@ static int config_read_key(void* user, const char* section, const char* name, co
 		IMPORT_SETTING(settings.hud_shadows, hud_shadows, atoi(value));
 		IMPORT_SETTING(settings.spectator_speed, spectator_speed, max(0.1F, min(4.F, atof(value))));
 		IMPORT_SETTING(settings.spectator_acceleration, spectator_acceleration, max(10.0F, min(200.0F, atof(value))));
+		IMPORT_SETTING(settings.spectator_fog_distance, spectator_fog_distance, max(5.f, min(512.f, atof(value))));
 		IMPORT_SETTING(settings.iron_sight, iron_sight, atoi(value));
 		IMPORT_SETTING(settings.gmi, gmi, atoi(value));
 		IMPORT_SETTING(settings.disable_raw_input, disable_raw_input, atoi(value));
@@ -209,19 +419,52 @@ static int config_read_key(void* user, const char* section, const char* name, co
 		IMPORT_SETTING(settings.show_live_player_count, show_live_player_count, atoi(value));
 		IMPORT_SETTING(settings.ads_zoom_animation, ads_zoom_animation, atoi(value));
 		IMPORT_SETTING(settings.auto_demo_recording, auto_demo_recording, atoi(value));
+		IMPORT_SETTING(settings.player_stats, player_stats, atoi(value));
+		IMPORT_SETTING(settings.player_technical_stats, player_technical_stats, atoi(value));
 		IMPORT_SETTING(settings.rain, rain, atoi(value));
 		IMPORT_SETTING(settings.snow, snow, atoi(value));
-		IMPORT_SETTING(settings.snow_3d, snow_3d, atoi(value));
+		IMPORT_SETTING(settings.rain_snow_3d, rain_snow_3d, atoi(value));
 		IMPORT_SETTING(settings.rifle_ads_fov, rifle_ads_fov, fmaxf(5.0F, fminf(atof(value), CAMERA_DEFAULT_FOV)));
 		IMPORT_SETTING(settings.shotgun_ads_fov, shotgun_ads_fov, fmaxf(5.0F, fminf(atof(value), CAMERA_DEFAULT_FOV)));
 		IMPORT_SETTING(settings.smg_ads_fov, smg_ads_fov, fmaxf(5.0F, fminf(atof(value), CAMERA_DEFAULT_FOV)));
+		IMPORT_SETTING(settings.disable_corpse_despawn, disable_corpse_despawn, atoi(value));
+		IMPORT_SETTING(settings.disable_dynamic_fov, disable_dynamic_fov, atoi(value));
+		IMPORT_SETTING(settings.textured_blocks, textured_blocks, atoi(value));
+		IMPORT_SETTING(settings.minimap_zoom, minimap_zoom, max(1, min(5, atoi(value))));
+		IMPORT_SETTING(settings.skin_spade, skin_spade, max(0, atoi(value)));
+		IMPORT_SETTING(settings.skin_grenade, skin_grenade, max(0, atoi(value)));
+		IMPORT_SETTING(settings.skin_rifle, skin_rifle, max(0, atoi(value)));
+		IMPORT_SETTING(settings.skin_smg, skin_smg, max(0, atoi(value)));
+		IMPORT_SETTING(settings.skin_shotgun, skin_shotgun, max(0, atoi(value)));
+		IMPORT_SETTING(settings.skin_player, skin_player, max(0, atoi(value)));
+		IMPORT_SETTING(settings.skin_intel, skin_intel, max(0, atoi(value)));
+		IMPORT_SETTING(settings.skin_tent, skin_tent, max(0, atoi(value)));
+		IMPORT_SETTING(settings.debug_log, debug_log, atoi(value));
+	}
+	if(!strcmp(section, "meta")) {
+		if(!strcmp(name, "backend")) {
+			strncpy(config_file_backend, value, sizeof(config_file_backend) - 1);
+			config_file_backend[sizeof(config_file_backend) - 1] = 0;
+		}
 	}
 	if(!strcmp(section, "controls")) {
 		for(int k = 0; k < list_size(&config_keys); k++) {
 			struct config_key_pair* key = list_get(&config_keys, k);
 			if(!strcmp(name, key->name)) {
-				log_debug("found override for %s, from %i to %i", key->name, key->def, atoi(value));
-				key->def = strtol(value, NULL, 0);
+				int named = config_keyname_to_code(value);
+				if(named >= 0) {
+					/* Symbolic name: already expressed in this backend's key
+					   codes, so it must not be touched by the migration pass. */
+					key->def = named;
+					if(k < CONFIG_KEYS_MAX)
+						config_key_named[k] = 1;
+				} else {
+					/* Legacy raw integer code; migrated post-parse if the file
+					   was written by a different backend. */
+					key->def = strtol(value, NULL, 0);
+				}
+				log_debug("found override for %s -> %i (%s)", key->name, key->def,
+						  named >= 0 ? "name" : "legacy code");
 				break;
 			}
 		}
@@ -356,6 +599,7 @@ void config_reload() {
 	config_register_key(WINDOW_KEY_ESCAPE, SDLK_ESCAPE, "quit_game", 0, "Quit", "Game");
 	config_register_key(WINDOW_KEY_ESCAPE, SDLK_AC_BACK, NULL, 0, NULL, NULL);
 	config_register_key(WINDOW_KEY_MAP, SDLK_m, "view_map", 1, "Map", "Information");
+	config_register_key(WINDOW_KEY_MAP_ZOOM, SDLK_x, "map_zoom", 0, "Map zoom", "Information");
 	config_register_key(WINDOW_KEY_CROUCH, SDLK_LCTRL, "crouch", 0, "Crouch", "Movement");
 	config_register_key(WINDOW_KEY_SNEAK, SDLK_v, "sneak", 0, "Sneak", "Movement");
 	config_register_key(WINDOW_KEY_ENTER, SDLK_RETURN, NULL, 0, NULL, NULL);
@@ -419,6 +663,7 @@ void config_reload() {
 	config_register_key(WINDOW_KEY_TAB, GLFW_KEY_TAB, "view_score", 0, "Score", "Information");
 	config_register_key(WINDOW_KEY_ESCAPE, GLFW_KEY_ESCAPE, "quit_game", 0, "Quit", "Game");
 	config_register_key(WINDOW_KEY_MAP, GLFW_KEY_M, "view_map", 1, "Map", "Information");
+	config_register_key(WINDOW_KEY_MAP_ZOOM, GLFW_KEY_X, "map_zoom", 0, "Map zoom", "Information");
 	config_register_key(WINDOW_KEY_CROUCH, GLFW_KEY_LEFT_CONTROL, "crouch", 0, "Crouch", "Movement");
 	config_register_key(WINDOW_KEY_SNEAK, GLFW_KEY_V, "sneak", 0, "Sneak", "Movement");
 	config_register_key(WINDOW_KEY_ENTER, GLFW_KEY_ENTER, NULL, 0, NULL, NULL);
@@ -464,11 +709,37 @@ void config_reload() {
 
 	list_sort(&config_keys, config_key_cmp);
 
+	strcpy(config_file_backend, "glfw");
+	memset(config_key_named, 0, sizeof(config_key_named));
+
 	char* s = file_load("config.ini");
 	if(s) {
+		log_debug("Loading config.ini (%zu bytes)", strlen(s));
 		ini_parse_string(s, config_read_key, NULL);
 		free(s);
+	} else {
+		log_debug("No config.ini found, using defaults");
 	}
+
+#ifdef USE_SDL
+	/* Single post-parse migration: now that the whole file has been read,
+	   config_file_backend is final, so [meta] and [controls] order in the file
+	   no longer matters.  Convert legacy raw GLFW key codes to SDL keysyms once.
+	   Bindings that were read as symbolic names are already correct and skipped. */
+	if(strcmp(config_file_backend, CONFIG_BACKEND) != 0) {
+		for(int k = 0; k < list_size(&config_keys); k++) {
+			if(k < CONFIG_KEYS_MAX && config_key_named[k])
+				continue;
+			struct config_key_pair* key = list_get(&config_keys, k);
+			int converted = config_glfw_to_sdl(key->def);
+			if(converted == key->def && key->def != key->original)
+				log_warn("config: no %s->%s mapping for key code %i (%s), kept as-is",
+						 config_file_backend, CONFIG_BACKEND, key->def,
+						 key->name[0] ? key->name : "<unnamed>");
+			key->def = converted;
+		}
+	}
+#endif
 
 	if(!list_created(&config_settings))
 		list_create(&config_settings, sizeof(struct config_setting));
@@ -516,6 +787,7 @@ void config_reload() {
 				 .max = INT_MAX,
 				 .name = "Game width",
 				 .help = "Default: 960",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -525,6 +797,7 @@ void config_reload() {
 				 .max = INT_MAX,
 				 .name = "Game height",
 				 .help = "Default: 540",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -542,6 +815,7 @@ void config_reload() {
 				 240,
 				 .defaults_length = 6,
 				 .label_callback = config_label_vsync,
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -550,6 +824,7 @@ void config_reload() {
 				 .min = 0,
 				 .max = 1,
 				 .name = "Fullscreen",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -566,6 +841,7 @@ void config_reload() {
 				 16,
 				 .defaults_length = 5,
 				 .label_callback = config_label_msaa,
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -575,6 +851,7 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Render models like in voxlap",
 				 .name = "Voxlap models",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -584,7 +861,7 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Render player hand during gameplay",
 				 .name = "Render hand",
-				 .category = "KyroSpades Settings",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -594,6 +871,7 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Only aim while pressing RMB",
 				 .name = "Hold down sights",
+				 .category = "Weapon Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -603,6 +881,7 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Join similar mesh faces",
 				 .name = "Greedy meshing",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -612,6 +891,7 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Enable this on buggy drivers",
 				 .name = "Force Displaylist",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -621,6 +901,7 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Enable this on buggy drivers",
 				 .name = "Smooth fog",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -630,6 +911,7 @@ void config_reload() {
 				 .max = 1,
 				 .help = "(won't work with greedy mesh)",
 				 .name = "Ambient occlusion",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -639,11 +921,12 @@ void config_reload() {
 				 .max = 5,
 				 .help = "Multiplier for ambient occlusion strength",
 				 .name = "AO multiplier",
-				 .category = "KyroSpades Settings",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
 				 .value = &settings_tmp.show_fps,
+				 .category = "HUD/UI Settings",
 				 .type = CONFIG_TYPE_INT,
 				 .min = 0,
 				 .max = 1,
@@ -676,24 +959,7 @@ void config_reload() {
 				 .max = 1.f,
 				 .help = "Chat background opacity",
 				 .name = "Chat background opacity",
-			 });
-	list_add(&config_settings,
-			 &(struct config_setting) {
-				 .value = &settings_tmp.bg_tile,
-				 .type = CONFIG_TYPE_INT,
-				 .min = 0,
-				 .max = 1,
-				 .name = "Tile background",
-				 .help = "Background will be stretched if disabled",
-			 });
-	list_add(&config_settings,
-			 &(struct config_setting) {
-				 .value = &settings_tmp.bg_tile_speed,
-				 .type = CONFIG_TYPE_FLOAT,
-				 .min = 0,
-				 .max = 2,
-				 .name = "Tile speed",
-				 .help = "The speed at which the tiles move",
+				 .category = "Chat Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -703,6 +969,7 @@ void config_reload() {
 				 .max = 255,
 				 .name = "UI Accent: Red",
 				 .help = "UI accent color (red)",
+				 .category = "HUD/UI Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -712,6 +979,7 @@ void config_reload() {
 				 .max = 255,
 				 .name = "UI Accent: Green",
 				 .help = "UI accent color (green)",
+				 .category = "HUD/UI Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -721,6 +989,7 @@ void config_reload() {
 				 .max = 255,
 				 .name = "UI Accent: Blue",
 				 .help = "UI accent color (blue)",
+				 .category = "HUD/UI Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -730,6 +999,7 @@ void config_reload() {
 				 .max = 255,
 				 .name = "Lighten colors",
 				 .help = "Makes in-game team colors in the HUD brighter",
+				 .category = "Graphic Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -737,8 +1007,9 @@ void config_reload() {
 				 .type = CONFIG_TYPE_INT,
 				 .min = 0,
 				 .max = 1,
-				 .name = "Show names in spectator",
+				 .name = "Spectator Player Names",
 				 .help = "Displays player names in spectator",
+				 .category = "Spectator Mode Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -746,9 +1017,9 @@ void config_reload() {
 				 .type = CONFIG_TYPE_INT,
 				 .min = 0,
 				 .max = 1,
-				 .name = "ESP in spectator",
+				 .name = "Spectator ESP",
 				 .help = "See players through walls in spectator mode",
-				 .category = "KyroSpades Settings",
+				 .category = "Spectator Mode Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -758,15 +1029,7 @@ void config_reload() {
 				 .max = 1,
 				 .name = "HUD shadows",
 				 .help = "Enables text shadows in various UI elements",
-			 });
-	list_add(&config_settings,
-			 &(struct config_setting) {
-				 .value = &settings_tmp.chat_flip_on_open,
-				 .type = CONFIG_TYPE_INT,
-				 .min = 0,
-				 .max = 1,
-				 .help = "Flip chat order when open",
-				 .name = "Reverse chat on open",
+				 .category = "HUD/UI Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -776,6 +1039,17 @@ void config_reload() {
 				 .max = 8,
 				 .help = "Spacing between messages in chat",
 				 .name = "Chat spacing",
+				 .category = "Chat Settings",
+			 });
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.chat_flip_on_open,
+				 .type = CONFIG_TYPE_INT,
+				 .min = 0,
+				 .max = 1,
+				 .help = "Reverse chat order, newest messages at the bottom",
+				 .name = "Reverse chat on open",
+				 .category = "Chat Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -784,7 +1058,7 @@ void config_reload() {
 				 .max = sizeof(settings.chat_mention_words) - 1,
 				 .name = "Mention words",
 				 .help = "Words separated by commas that highlight chat messages",
-				 .category = "KyroSpades Settings",
+				 .category = "Chat Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -794,7 +1068,7 @@ void config_reload() {
 				 .max = 255,
 				 .name = "Mention Highlight: Red",
 				 .help = "Mention highlight color (red)",
-				 .category = "KyroSpades Settings",
+				 .category = "Chat Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -804,7 +1078,7 @@ void config_reload() {
 				 .max = 255,
 				 .name = "Mention Highlight: Green",
 				 .help = "Mention highlight color (green)",
-				 .category = "KyroSpades Settings",
+				 .category = "Chat Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -814,7 +1088,7 @@ void config_reload() {
 				 .max = 255,
 				 .name = "Mention Highlight: Blue",
 				 .help = "Mention highlight color (blue)",
-				 .category = "KyroSpades Settings",
+				 .category = "Chat Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -823,7 +1097,8 @@ void config_reload() {
 				 .min = 0.1F,
 				 .max = 4.F,
 				 .help = "Speed of movement in spectator",
-				 .name = "Spectator speed",
+				 .name = "Spectator Speed",
+				 .category = "Spectator Mode Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -831,8 +1106,18 @@ void config_reload() {
 				 .type = CONFIG_TYPE_FLOAT,
 				 .min = 10,
 				 .max = 200,
-				 .help = "Rate of acceleration and deceleration for spectator camera",
-				 .name = "Spectator camera acceleration",
+			.help = "Rate of acceleration and deceleration for spectator camera",
+			 .name = "Spectator Camera Acceleration",
+			 .category = "Spectator Mode Settings",
+		 });
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.spectator_fog_distance,
+				 .type = CONFIG_TYPE_FLOAT,
+				 .min = 5,
+				 .max = 512,
+				 .help = "Fog distance in spectator mode (also increases render distance)",
+				 .name = "Spectator Fog Distance",
 				 .category = "Spectator Mode Settings",
 			 });
 	list_add(&config_settings,
@@ -843,6 +1128,7 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Use weapon-specific iron sights instead of a dot",
 				 .name = "Iron sight",
+				 .category = "Weapon Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -852,6 +1138,7 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Integrate gamemode features in the HUD",
 				 .name = "GMI (experimental)",
+				 .category = "HUD/UI Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -861,7 +1148,7 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Always show live player count when GMI is enabled",
 				 .name = "Show live player count",
-				 .category = "KyroSpades Settings",
+				 .category = "HUD/UI Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -880,6 +1167,7 @@ void config_reload() {
 				 .max = 32,
 				 .help = "Spacing between UI elements",
 				 .name = "UI Spacing",
+				 .category = "HUD/UI Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -889,6 +1177,7 @@ void config_reload() {
 				 .max = 32,
 				 .help = "Added padding for UI elements",
 				 .name = "UI Padding",
+				 .category = "HUD/UI Settings",
 			 });
 	list_add(&config_settings,
 			 &(struct config_setting) {
@@ -898,7 +1187,17 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Enable zoom animation when aiming down sights (ADS)",
 				 .name = "ADS zoom animation",
-				 .category = "KyroSpades Settings",
+				 .category = "Weapon Settings",
+			 });
+
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.disable_corpse_despawn,
+				 .type = CONFIG_TYPE_INT,
+				 .min = 0,
+				 .max = 1,
+				 .help = "Dead player models remain permanently on the map",
+				 .name = "Disable corpse despawn",
 			 });
 
 	list_add(&config_settings,
@@ -909,7 +1208,60 @@ void config_reload() {
 				 .max = 1,
 				 .help = "Automatically record demo files when connecting to a server",
 				 .name = "Auto Demo Recording",
-				 .category = "KyroSpades Settings",
+			 });
+
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.player_stats,
+				 .type = CONFIG_TYPE_INT,
+				 .min = 0,
+				 .max = 1,
+				 .help = "Displays player statistics",
+				 .name = "Player stats display",
+				 .category = "HUD/UI Settings",
+			 });
+
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.player_technical_stats,
+				 .type = CONFIG_TYPE_INT,
+				 .min = 0,
+				 .max = 1,
+			 .help = "Displays technical statistics (particles, vertices)",
+				 .name = "Technical stats display",
+				 .category = "HUD/UI Settings",
+		 });
+
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.disable_dynamic_fov,
+				 .type = CONFIG_TYPE_INT,
+				 .min = 0,
+				 .max = 1,
+				 .help = "Disable FOV changes on sprint/crouch and makes crouch instant",
+				 .name = "Disable Dynamic FOV",
+		 });
+
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.textured_blocks,
+				 .type = CONFIG_TYPE_INT,
+				 .min = 0,
+				 .max = 1,
+				 .help = "Enables multitextured blocks with texture atlas blending",
+				 .name = "Textured Blocks",
+				 .category = "Graphic Settings",
+			 });
+
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.minimap_zoom,
+				 .type = CONFIG_TYPE_INT,
+				 .min = 1,
+				 .max = 5,
+				 .help = "Minimap zoom level (1-5)",
+				 .name = "Minimap zoom",
+				 .category = "HUD/UI Settings",
 			 });
 
 	list_add(&config_settings,
@@ -936,13 +1288,57 @@ void config_reload() {
 
 	list_add(&config_settings,
 			 &(struct config_setting) {
-				 .value = &settings_tmp.snow_3d,
+				 .value = &settings_tmp.rain_snow_3d,
 				 .type = CONFIG_TYPE_INT,
 				 .min = 0,
 				 .max = 1,
-				 .help = "Enable 3D snow (full cube rendering)",
-				 .name = "3D Snow",
+				 .help = "Enable 3D rain and snow (full cube rendering)",
+				 .name = "3D Rain & Snow",
 				 .category = "Weather",
+			 });
+
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.exposure,
+				 .type = CONFIG_TYPE_FLOAT,
+				 .min = -100,
+				 .max = 100,
+				 .help = "Adjust image exposure (-100 to +100)",
+				 .name = "Exposure",
+				 .category = "Graphic Settings",
+			 });
+
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.saturation,
+				 .type = CONFIG_TYPE_FLOAT,
+				 .min = -100,
+				 .max = 100,
+				 .help = "Adjust image saturation (-100 to +100)",
+				 .name = "Saturation",
+				 .category = "Graphic Settings",
+			 });
+
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.contrast,
+				 .type = CONFIG_TYPE_FLOAT,
+				 .min = -100,
+				 .max = 100,
+				 .help = "Adjust image contrast (-100 to +100)",
+				 .name = "Contrast",
+				 .category = "Graphic Settings",
+			 });
+
+	list_add(&config_settings,
+			 &(struct config_setting) {
+				 .value = &settings_tmp.vignette,
+				 .type = CONFIG_TYPE_FLOAT,
+				 .min = 0,
+				 .max = 100,
+				 .help = "Darkens edges of the screen (0 to 100)",
+				 .name = "Vignette",
+				 .category = "Graphic Settings",
 			 });
 
 	list_add(&config_settings,

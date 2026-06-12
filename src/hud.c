@@ -52,9 +52,36 @@
 #include "sound.h"
 #include "gmi.h"
 #include "chatlog.h"
+#include "particle.h"
+#include "model.h"
+#include "skins.h"
 
 struct hud* hud_active;
 struct window_instance* hud_window;
+
+int player_stats_blocks_placed = 0;
+int player_stats_kills = 0;
+int player_stats_headshots = 0;
+int player_stats_deaths = 0;
+float player_stats_distance = 0.0F;
+int player_stats_jumps = 0;
+
+static float player_stats_last_x = 0.0F;
+static float player_stats_last_y = 0.0F;
+static float player_stats_last_z = 0.0F;
+static float particle_stats_last_time = 0.0F;
+static int particle_stats_last_total = 0;
+static float particle_stats_created_per_second = 0.0F;
+static double spec_color_palette_time = 0.0;
+
+void player_stats_reset() {
+	player_stats_blocks_placed = 0;
+	player_stats_kills = 0;
+	player_stats_headshots = 0;
+	player_stats_deaths = 0;
+	player_stats_distance = 0.0F;
+	player_stats_jumps = 0;
+}
 
 #define LIGHTEN(c) (255.F * (settings.lighten_colors / 255.F) + c * (1.F - settings.lighten_colors / 255.F))
 
@@ -66,12 +93,27 @@ static int is_inside(double mx, double my, int x, int y, int w, int h) {
 	return mx >= x && mx < x + w && my >= y && my < y + h;
 }
 
+static void format_comma(char* buffer, int value) {
+	char tmp[32];
+	sprintf(tmp, "%d", value);
+	int len = strlen(tmp);
+	int j = 0;
+	for(int i = 0; i < len; i++) {
+		if(i > 0 && (len - i) % 3 == 0) {
+			buffer[j++] = ',';
+		}
+		buffer[j++] = tmp[i];
+	}
+	buffer[j] = '\0';
+}
+
 void hud_init() {
 	hud_serverlist.ctx = malloc(sizeof(mu_Context));
 	hud_settings.ctx = malloc(sizeof(mu_Context));
 	hud_controls.ctx = malloc(sizeof(mu_Context));
 	hud_chatlog.ctx = malloc(sizeof(mu_Context));
 	hud_demolist.ctx = malloc(sizeof(mu_Context));
+	hud_skins.ctx = malloc(sizeof(mu_Context));
 
 	hud_change(&hud_serverlist);
 }
@@ -718,6 +760,18 @@ static inline void hud_font_render(float x, float y, float h, char* text, float 
 	}
 }
 
+static inline void hud_font_render_outlined(float x, float y, float h, char* text, float a) {
+	float color[4];
+	glGetFloatv(GL_CURRENT_COLOR, color);
+	glColor4f(0.F, 0.F, 0.F, a);
+	font_render(x - 1.F, y, h, text);
+	font_render(x + 1.F, y, h, text);
+	font_render(x, y - 1.F, h, text);
+	font_render(x, y + 1.F, h, text);
+	glColor4f(color[0], color[1], color[2], color[3]);
+	font_render(x, y, h, text);
+}
+
 static inline void hud_font_render_centered(float x, float y, float h, char* text, float a) {
 	if(settings.hud_shadows) {
 		font_centered_shadow(x, y, h, text, a);
@@ -900,6 +954,34 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 
 	hud_active->render_localplayer = players[local_player_id].team != TEAM_SPECTATOR
 		&& (screen_current == SCREEN_NONE || camera_mode != CAMERAMODE_FPS);
+
+	if(settings.player_stats) {
+		if(!network_connected || !network_logged_in
+		   || players[local_player_id].team == TEAM_SPECTATOR) {
+			player_stats_reset();
+			player_stats_last_x = players[local_player_id].pos.x;
+			player_stats_last_y = players[local_player_id].pos.y;
+			player_stats_last_z = players[local_player_id].pos.z;
+		} else {
+			float dx = players[local_player_id].pos.x - player_stats_last_x;
+			float dy = players[local_player_id].pos.y - player_stats_last_y;
+			float dz = players[local_player_id].pos.z - player_stats_last_z;
+			float dist = sqrt(dx*dx + dy*dy + dz*dz);
+			if(dist < 10.0F) {
+				player_stats_distance += dist;
+			}
+			player_stats_last_x = players[local_player_id].pos.x;
+			player_stats_last_y = players[local_player_id].pos.y;
+			player_stats_last_z = players[local_player_id].pos.z;
+		}
+		float now = window_time();
+		float dt = now - particle_stats_last_time;
+		if(dt >= 0.5F) {
+			particle_stats_created_per_second = (particle_stats_total_created - particle_stats_last_total) / dt;
+			particle_stats_last_total = particle_stats_total_created;
+			particle_stats_last_time = now;
+		}
+	}
 
 	if(cameracontroller_yclamp) {
 		glColor3f(1.0F, 1.0F, 1.0F);
@@ -1240,12 +1322,23 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 		   || (camera_mode == CAMERAMODE_SPECTATOR && cameracontroller_bodyview_mode)) {
 			if(cameracontroller_bodyview_player != local_player_id) {
 				font_select(FONT_FIXEDSYS);
+				char bv_buf[64];
+				snprintf(bv_buf, sizeof(bv_buf), "Spectating %s", players[cameracontroller_bodyview_player].name);
+				float bv_nh = 22.F;
+				float bv_nx = settings.window_width / 2.0F - font_length(bv_nh, bv_buf) / 2.0F;
+				float bv_ny = 4.F + bv_nh;
+				unsigned char bv_r = 255, bv_g = 255, bv_b = 255;
 				switch(players[cameracontroller_bodyview_player].team) {
-					case TEAM_1: glColor3ub(gamestate.team_1.red, gamestate.team_1.green, gamestate.team_1.blue); break;
-					case TEAM_2: glColor3ub(gamestate.team_2.red, gamestate.team_2.green, gamestate.team_2.blue); break;
+					case TEAM_1: bv_r = gamestate.team_1.red; bv_g = gamestate.team_1.green; bv_b = gamestate.team_1.blue; break;
+					case TEAM_2: bv_r = gamestate.team_2.red; bv_g = gamestate.team_2.green; bv_b = gamestate.team_2.blue; break;
 				}
-				font_centered(settings.window_width / 2.0F, settings.window_height * 0.25F, 16.0F,
-							  players[cameracontroller_bodyview_player].name);
+				glColor3ub(bv_r, bv_g, bv_b);
+				font_render(bv_nx - 1.F, bv_ny, bv_nh, bv_buf);
+				font_render(bv_nx + 1.F, bv_ny, bv_nh, bv_buf);
+				font_render(bv_nx, bv_ny - 1.F, bv_nh, bv_buf);
+				font_render(bv_nx, bv_ny + 1.F, bv_nh, bv_buf);
+				glColor3ub(255, 255, 255);
+				font_render(bv_nx, bv_ny, bv_nh, bv_buf);
 			}
 			font_select(FONT_FIXEDSYS);
 			mu_Color color = mu_accent_color(1.F, 255);
@@ -1267,6 +1360,30 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 				}
 			}
 			glColor3f(1.0F, 1.0F, 1.0F);
+		}
+
+		if(camera_mode == CAMERAMODE_SPECTATOR && !cameracontroller_bodyview_mode
+		   && player_intersection_type >= 0 && player_intersection_player >= 0
+		   && player_intersection_player < PLAYERS_MAX
+		   && players[player_intersection_player].team != TEAM_SPECTATOR) {
+			font_select(FONT_FIXEDSYS);
+			char hv_buf[64];
+			snprintf(hv_buf, sizeof(hv_buf), "Spectating %s", players[player_intersection_player].name);
+			float hv_nh = 22.F;
+			float hv_nx = settings.window_width / 2.0F - font_length(hv_nh, hv_buf) / 2.0F;
+			float hv_ny = 4.F + hv_nh;
+			unsigned char hv_r = 255, hv_g = 255, hv_b = 255;
+			switch(players[player_intersection_player].team) {
+				case TEAM_1: hv_r = gamestate.team_1.red; hv_g = gamestate.team_1.green; hv_b = gamestate.team_1.blue; break;
+				case TEAM_2: hv_r = gamestate.team_2.red; hv_g = gamestate.team_2.green; hv_b = gamestate.team_2.blue; break;
+			}
+			glColor3ub(hv_r, hv_g, hv_b);
+			font_render(hv_nx - 1.F, hv_ny, hv_nh, hv_buf);
+			font_render(hv_nx + 1.F, hv_ny, hv_nh, hv_buf);
+			font_render(hv_nx, hv_ny - 1.F, hv_nh, hv_buf);
+			font_render(hv_nx, hv_ny + 1.F, hv_nh, hv_buf);
+			glColor3ub(255, 255, 255);
+			font_render(hv_nx, hv_ny, hv_nh, hv_buf);
 		}
 
 		if(camera_mode == CAMERAMODE_FPS
@@ -1459,6 +1576,107 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 				// shadow
 				texture_draw_empty(settings.window_width - 8.F - 32.F, gmi_y, 32.F, 2.F);
 			}
+		}
+
+		if(camera_mode == CAMERAMODE_SPECTATOR && spec_color_palette_time > window_time()) {
+			unsigned int cur = rgb((int)(fog_color[0] * 255.0F + 0.5F), (int)(fog_color[1] * 255.0F + 0.5F),
+								   (int)(fog_color[2] * 255.0F + 0.5F));
+			for(int y = 0; y < 8; y++) {
+				for(int x = 0; x < 8; x++) {
+					if(texture_block_color(x, y) == cur) {
+						unsigned char g = (((int)(window_time() * 4)) & 1) * 0xFF;
+						glColor3ub(g, g, g);
+						texture_draw_empty(settings.window_width + (x * 8 - 65 - 7), 48.F + (65 - y * 8),
+										   8, 8);
+						y = 10;
+						break;
+					}
+				}
+			}
+			glColor3f(1.0F, 1.0F, 1.0F);
+			texture_draw(&texture_color_selection, settings.window_width - 64 - 7, 48.F + 64, 64, 64);
+		}
+
+		if(settings.player_stats && network_connected && network_logged_in
+		   && players[local_player_id].team != TEAM_SPECTATOR) {
+			font_select(FONT_FIXEDSYS);
+			struct Team* team = players[local_player_id].team == TEAM_1
+				? &gamestate.team_1 : &gamestate.team_2;
+			float x = 8.F;
+			float y = settings.window_height / 2.F - 60.F;
+			float h = 16.F;
+			char line[64];
+			char num_buf[32];
+
+			glColor3ub(team->red, team->green, team->blue);
+			format_comma(num_buf, player_stats_blocks_placed);
+			sprintf(line, "Blocks Placed: %s", num_buf);
+			hud_font_render_outlined(x, y, h, line, 1.F);
+
+			format_comma(num_buf, player_stats_kills);
+			sprintf(line, "Kills: %s", num_buf);
+			hud_font_render_outlined(x, y + h, h, line, 1.F);
+
+			format_comma(num_buf, player_stats_headshots);
+			sprintf(line, "Headshot Kills: %s", num_buf);
+			hud_font_render_outlined(x, y + h * 2, h, line, 1.F);
+
+			format_comma(num_buf, player_stats_deaths);
+			sprintf(line, "Deaths: %s", num_buf);
+			hud_font_render_outlined(x, y + h * 3, h, line, 1.F);
+
+			format_comma(num_buf, (int)player_stats_distance);
+			sprintf(line, "Distance Traveled: %s blocks", num_buf);
+			hud_font_render_outlined(x, y + h * 4, h, line, 1.F);
+
+			format_comma(num_buf, player_stats_jumps);
+			sprintf(line, "Jumps: %s", num_buf);
+			hud_font_render_outlined(x, y + h * 5, h, line, 1.F);
+
+			font_select(FONT_FIXEDSYS);
+		}
+
+		if(settings.player_technical_stats && network_connected && network_logged_in
+		   && players[local_player_id].team != TEAM_SPECTATOR) {
+			font_select(FONT_FIXEDSYS);
+			struct Team* team = players[local_player_id].team == TEAM_1
+				? &gamestate.team_1 : &gamestate.team_2;
+			float right_edge = settings.window_width - 8.F;
+			float y = settings.window_height / 2.F - 44.F;
+			float h = 16.F;
+			char line[64];
+			char num_buf[32];
+
+			glColor3ub(team->red, team->green, team->blue);
+			format_comma(num_buf, particle_stats_count);
+			sprintf(line, "Particles: %s", num_buf);
+			hud_font_render_outlined(right_edge - font_length(h, line), y, h, line, 1.F);
+
+			format_comma(num_buf, (int)particle_stats_created_per_second);
+			sprintf(line, "New Parts/s: %s", num_buf);
+			hud_font_render_outlined(right_edge - font_length(h, line), y + h, h, line, 1.F);
+
+			format_comma(num_buf, particle_stats_vertices);
+			sprintf(line, "Vertices: %s", num_buf);
+			hud_font_render_outlined(right_edge - font_length(h, line), y + h * 2, h, line, 1.F);
+
+			format_comma(num_buf, model_total_voxels() + map_total_blocks());
+			sprintf(line, "Voxels: %s", num_buf);
+			hud_font_render_outlined(right_edge - font_length(h, line), y + h * 3, h, line, 1.F);
+
+			int* pick_pos = camera_terrain_pick(1);
+			if(pick_pos) {
+				double dx = pick_pos[0] - camera_x;
+				double dy = pick_pos[1] - camera_y;
+				double dz = pick_pos[2] - camera_z;
+				double dist = sqrt(dx*dx + dy*dy + dz*dz);
+				sprintf(line, "Dist: %.0f", dist);
+			} else {
+				sprintf(line, "Dist: --");
+			}
+			hud_font_render_outlined(right_edge - font_length(h, line), y + h * 4, h, line, 1.F);
+
+			font_select(FONT_FIXEDSYS);
 		}
 
 		if(camera_mode != CAMERAMODE_SELECTION) {
@@ -1659,7 +1877,7 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 				}
 				font_select(FONT_FIXEDSYS);
 
-				tracer_minimap(1, scalef, minimap_x, minimap_y);
+				tracer_minimap(1, scalef, minimap_x, minimap_y, 512.0F);
 
 				if(gamestate.gamemode_type == GAMEMODE_CTF) {
 					if(!gamestate.gamemode.ctf.team_1_intel) {
@@ -1746,8 +1964,13 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 				glColor3f(1.0F, 1.0F, 1.0F);
 			} else {
 				// minimized, top right
-				float view_x = camera_x - 64.0F; // min(max(camera_x-64.0F,0.0F),map_size_x+1-128.0F);
-				float view_z = camera_z - 64.0F; // min(max(camera_z-64.0F,0.0F),map_size_z+1-128.0F);
+				float zoom_sizes[] = {32.0F, 64.0F, 128.0F, 256.0F, 512.0F};
+				int zoom_idx = max(0, min(4, settings.minimap_zoom - 1));
+				float viewport = zoom_sizes[zoom_idx];
+				float half_vp = viewport / 2.0F;
+				float view_x = camera_x - half_vp;
+				float view_z = camera_z - half_vp;
+				float map_scale = 128.0F / viewport;
 				char sector_str[3] = {(int)(camera_x / 64.0F) + 'A', (int)(camera_z / 64.0F) + '1', 0};
 				glColor4f(0.F, 0.F, 0.F, 0.7F);
 
@@ -1766,60 +1989,60 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 				glColor3f(1.0F, 1.0F, 1.0F);
 
 				texture_draw_sector(&texture_minimap, settings.window_width - 143 * scalef, 585 * scalef, 128 * scalef,
-									128 * scalef, (camera_x - 64.0F) / 512.0F, (camera_z - 64.0F) / 512.0F, 0.25F,
-									0.25F);
+									128 * scalef, (camera_x - half_vp) / 512.0F, (camera_z - half_vp) / 512.0F,
+									viewport / 512.0F, viewport / 512.0F);
 
-				tracer_minimap(0, scalef, view_x, view_z);
+				tracer_minimap(0, scalef, view_x, view_z, viewport);
 
 				if(gamestate.gamemode_type == GAMEMODE_CTF) {
-					float tent1_x = min(max(gamestate.gamemode.ctf.team_1_base.x, view_x), view_x + 128.0F) - view_x;
-					float tent1_y = min(max(gamestate.gamemode.ctf.team_1_base.y, view_z), view_z + 128.0F) - view_z;
+					float tent1_x = min(max(gamestate.gamemode.ctf.team_1_base.x, view_x), view_x + viewport) - view_x;
+					float tent1_y = min(max(gamestate.gamemode.ctf.team_1_base.y, view_z), view_z + viewport) - view_z;
 
-					float tent2_x = min(max(gamestate.gamemode.ctf.team_2_base.x, view_x), view_x + 128.0F) - view_x;
-					float tent2_y = min(max(gamestate.gamemode.ctf.team_2_base.y, view_z), view_z + 128.0F) - view_z;
+					float tent2_x = min(max(gamestate.gamemode.ctf.team_2_base.x, view_x), view_x + viewport) - view_x;
+					float tent2_y = min(max(gamestate.gamemode.ctf.team_2_base.y, view_z), view_z + viewport) - view_z;
 
 					if(map_object_visible(gamestate.gamemode.ctf.team_1_base.x, 0.0F,
 										  gamestate.gamemode.ctf.team_1_base.y)) {
 						glColor3ub(gamestate.team_1.red * 0.94F, gamestate.team_1.green * 0.94F,
 								   gamestate.team_1.blue * 0.94F);
-						texture_draw_empty_rotated(settings.window_width - 143 * scalef + tent1_x * scalef,
-												   (585 - tent1_y) * scalef, 12 * scalef, 12 * scalef, 0.0F);
+texture_draw_empty_rotated(settings.window_width - 143 * scalef + tent1_x * map_scale * scalef,
+                           (585 - tent1_y * map_scale) * scalef, 12 * scalef, 12 * scalef, 0.0F);
 						glColor3f(1.0F, 1.0F, 1.0F);
-						texture_draw_rotated(&texture_medical, settings.window_width - 143 * scalef + tent1_x * scalef,
-											 (585 - tent1_y) * scalef, 12 * scalef, 12 * scalef, 0.0F);
+						texture_draw_rotated(&texture_medical, settings.window_width - 143 * scalef + tent1_x * map_scale * scalef,
+											 (585 - tent1_y * map_scale) * scalef, 12 * scalef, 12 * scalef, 0.0F);
 					}
 					if(!gamestate.gamemode.ctf.team_1_intel) {
 						float intel_x
-							= min(max(gamestate.gamemode.ctf.team_1_intel_location.dropped.x, view_x), view_x + 128.0F)
+							= min(max(gamestate.gamemode.ctf.team_1_intel_location.dropped.x, view_x), view_x + viewport)
 							- view_x;
 						float intel_y
-							= min(max(gamestate.gamemode.ctf.team_1_intel_location.dropped.y, view_z), view_z + 128.0F)
+							= min(max(gamestate.gamemode.ctf.team_1_intel_location.dropped.y, view_z), view_z + viewport)
 							- view_z;
 						glColor3ub(gamestate.team_1.red, gamestate.team_1.green, gamestate.team_1.blue);
-						texture_draw_rotated(&texture_intel, settings.window_width - 143 * scalef + intel_x * scalef,
-											 (585 - intel_y) * scalef, 12 * scalef, 12 * scalef, 0.0F);
+						texture_draw_rotated(&texture_intel, settings.window_width - 143 * scalef + intel_x * map_scale * scalef,
+											 (585 - intel_y * map_scale) * scalef, 12 * scalef, 12 * scalef, 0.0F);
 					}
 
 					if(map_object_visible(gamestate.gamemode.ctf.team_2_base.x, 0.0F,
 										  gamestate.gamemode.ctf.team_2_base.y)) {
 						glColor3ub(gamestate.team_2.red * 0.94F, gamestate.team_2.green * 0.94F,
 								   gamestate.team_2.blue * 0.94F);
-						texture_draw_empty_rotated(settings.window_width - 143 * scalef + tent2_x * scalef,
-												   (585 - tent2_y) * scalef, 12 * scalef, 12 * scalef, 0.0F);
+texture_draw_empty_rotated(settings.window_width - 143 * scalef + tent2_x * map_scale * scalef,
+                           (585 - tent2_y * map_scale) * scalef, 12 * scalef, 12 * scalef, 0.0F);
 						glColor3f(1.0F, 1.0F, 1.0F);
-						texture_draw_rotated(&texture_medical, settings.window_width - 143 * scalef + tent2_x * scalef,
-											 (585 - tent2_y) * scalef, 12 * scalef, 12 * scalef, 0.0F);
+						texture_draw_rotated(&texture_medical, settings.window_width - 143 * scalef + tent2_x * map_scale * scalef,
+											 (585 - tent2_y * map_scale) * scalef, 12 * scalef, 12 * scalef, 0.0F);
 					}
 					if(!gamestate.gamemode.ctf.team_2_intel) {
 						float intel_x
-							= min(max(gamestate.gamemode.ctf.team_2_intel_location.dropped.x, view_x), view_x + 128.0F)
+							= min(max(gamestate.gamemode.ctf.team_2_intel_location.dropped.x, view_x), view_x + viewport)
 							- view_x;
 						float intel_y
-							= min(max(gamestate.gamemode.ctf.team_2_intel_location.dropped.y, view_z), view_z + 128.0F)
+							= min(max(gamestate.gamemode.ctf.team_2_intel_location.dropped.y, view_z), view_z + viewport)
 							- view_z;
 						glColor3ub(gamestate.team_2.red, gamestate.team_2.green, gamestate.team_2.blue);
-						texture_draw_rotated(&texture_intel, settings.window_width - 143 * scalef + intel_x * scalef,
-											 (585 - intel_y) * scalef, 12 * scalef, 12 * scalef, 0.0F);
+						texture_draw_rotated(&texture_intel, settings.window_width - 143 * scalef + intel_x * map_scale * scalef,
+											 (585 - intel_y * map_scale) * scalef, 12 * scalef, 12 * scalef, 0.0F);
 					}
 				}
 				if(gamestate.gamemode_type == GAMEMODE_TC) {
@@ -1836,10 +2059,10 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 							default:
 							case TEAM_SPECTATOR: glColor3ub(0, 0, 0);
 						}
-						float t_x = min(max(gamestate.gamemode.tc.territory[k].x, view_x), view_x + 128.0F) - view_x;
-						float t_y = min(max(gamestate.gamemode.tc.territory[k].y, view_z), view_z + 128.0F) - view_z;
-						texture_draw_rotated(&texture_command, settings.window_width - 143 * scalef + t_x * scalef,
-											 (585 - t_y) * scalef, 12 * scalef, 12 * scalef, 0.0F);
+						float t_x = min(max(gamestate.gamemode.tc.territory[k].x, view_x), view_x + viewport) - view_x;
+						float t_y = min(max(gamestate.gamemode.tc.territory[k].y, view_z), view_z + viewport) - view_z;
+						texture_draw_rotated(&texture_command, settings.window_width - 143 * scalef + t_x * map_scale * scalef,
+											 (585 - t_y * map_scale) * scalef, 12 * scalef, 12 * scalef, 0.0F);
 					}
 				}
 
@@ -1862,13 +2085,13 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 						}
 						float player_x = ((k == local_player_id) ? camera_x : players[k].pos.x) - view_x;
 						float player_y = ((k == local_player_id) ? camera_z : players[k].pos.z) - view_z;
-						if(player_x > 0.0F && player_x < 128.0F && player_y > 0.0F && player_y < 128.0F) {
+						if(player_x >= 0.0F && player_x <= viewport && player_y >= 0.0F && player_y <= viewport) {
 							float ang = (k == local_player_id) ?
 								camera_rot_x + PI :
 								-atan2(players[k].orientation.z, players[k].orientation.x) - HALFPI;
 							texture_draw_rotated(&texture_player,
-												 settings.window_width - 143 * scalef + player_x * scalef,
-												 (585 - player_y) * scalef, 12 * scalef, 12 * scalef, ang);
+												 settings.window_width - 143 * scalef + player_x * map_scale * scalef,
+												 (585 - player_y * map_scale) * scalef, 12 * scalef, 12 * scalef, ang);
 						}
 					}
 				}
@@ -1899,6 +2122,25 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 			font_centered(settings.window_width / 2.F, settings.window_height / 2.0F, 32.F, chat_popup);
 		}
 		glColor3f(1.0F, 1.0F, 1.0F);
+
+		if(local_player_drag_active && local_player_drag_amount > 0) {
+			char drag_str[16];
+			font_select(FONT_FIXEDSYS);
+			sprintf(drag_str, "%i", local_player_drag_amount);
+			float cx = settings.window_width / 2.0F;
+			float cy = 50.F;
+			float tw = font_length(32.F, drag_str);
+			float sx = cx - tw / 2.0F;
+			glColor4f(0.F, 0.F, 0.F, 1.F);
+			font_render(sx - 1.F, cy, 32.F, drag_str);
+			font_render(sx + 1.F, cy, 32.F, drag_str);
+			font_render(sx, cy - 1.F, 32.F, drag_str);
+			font_render(sx, cy + 1.F, 32.F, drag_str);
+			glColor3ub(players[local_player_id].block.red,
+					   players[local_player_id].block.green,
+					   players[local_player_id].block.blue);
+			font_render(sx, cy, 32.F, drag_str);
+		}
 	}
 
 	if(settings.show_fps) {
@@ -2405,6 +2647,17 @@ static void hud_ingame_keyboard(int key, int action, int mods, int internal) {
 				chat_add(0, 0x00FFFF, volstr);
 			}
 
+			if(key == WINDOW_KEY_MAP_ZOOM) {
+				settings.minimap_zoom++;
+				if(settings.minimap_zoom > 5)
+					settings.minimap_zoom = 1;
+				char zoomstr[64];
+				float zoom_sizes[] = {32.0F, 64.0F, 128.0F, 256.0F, 512.0F};
+				sprintf(zoomstr, "Minimap: %ix%i", (int)zoom_sizes[settings.minimap_zoom - 1],
+						(int)zoom_sizes[settings.minimap_zoom - 1]);
+				chat_add(0, 0x00FFFF, zoomstr);
+			}
+
 			if(key == WINDOW_KEY_COMMAND) {
 				window_textinput(1);
 				chat_input_mode = CHAT_ALL_INPUT;
@@ -2458,11 +2711,54 @@ static void hud_ingame_keyboard(int key, int action, int mods, int internal) {
 						}
 					}
 				}
-				if(y < 10) {
-					players[local_player_id].block.packed = texture_block_color(3, 0);
-					network_updateColor();
+		if(y < 10) {
+				players[local_player_id].block.packed = texture_block_color(3, 0);
+				network_updateColor();
+			}
+		} else if((key == WINDOW_KEY_CURSOR_UP || key == WINDOW_KEY_CURSOR_DOWN || key == WINDOW_KEY_CURSOR_LEFT
+				   || key == WINDOW_KEY_CURSOR_RIGHT)
+				  && camera_mode == CAMERAMODE_SPECTATOR) {
+			int py;
+			unsigned int cur = rgb((int)(fog_color[0] * 255.0F + 0.5F), (int)(fog_color[1] * 255.0F + 0.5F), (int)(fog_color[2] * 255.0F + 0.5F));
+			for(py = 0; py < 8; py++) {
+				for(int px = 0; px < 8; px++) {
+					if(texture_block_color(px, py) == cur) {
+						switch(key) {
+							case WINDOW_KEY_CURSOR_LEFT:
+								px--;
+								if(px < 0) px = 7;
+								break;
+							case WINDOW_KEY_CURSOR_RIGHT:
+								px++;
+								if(px > 7) px = 0;
+								break;
+							case WINDOW_KEY_CURSOR_UP:
+								py--;
+								if(py < 0) py = 7;
+								break;
+							case WINDOW_KEY_CURSOR_DOWN:
+								py++;
+								if(py > 7) py = 0;
+								break;
+						}
+						cur = texture_block_color(px, py);
+						fog_color[0] = (cur & 0xFF) / 255.0F;
+						fog_color[1] = ((cur >> 8) & 0xFF) / 255.0F;
+						fog_color[2] = ((cur >> 16) & 0xFF) / 255.0F;
+						spec_color_palette_time = window_time() + 2.0;
+						py = 10;
+						break;
+					}
 				}
 			}
+			if(py < 10) {
+				cur = texture_block_color(3, 0);
+				fog_color[0] = (cur & 0xFF) / 255.0F;
+				fog_color[1] = ((cur >> 8) & 0xFF) / 255.0F;
+				fog_color[2] = ((cur >> 16) & 0xFF) / 255.0F;
+				spec_color_palette_time = window_time() + 2.0;
+			}
+		}
 
 			if(key == WINDOW_KEY_RELOAD && camera_mode == CAMERAMODE_FPS
 			   && players[local_player_id].held_item == TOOL_GUN) {
@@ -2540,7 +2836,12 @@ static void hud_ingame_keyboard(int key, int action, int mods, int internal) {
 						p.player_id = local_player_id;
 						p.team = new_team;
 						network_send(PACKET_CHANGETEAM_ID, &p, sizeof(p));
-						screen_current = SCREEN_NONE;
+						// If switching from spectator to a team, show weapon select
+						if(players[local_player_id].team == TEAM_SPECTATOR && new_team != TEAM_SPECTATOR) {
+							screen_current = SCREEN_GUN_SELECT;
+						} else {
+							screen_current = SCREEN_NONE;
+						}
 						return;
 					} else {
 						local_player_newteam = new_team;
@@ -2647,9 +2948,9 @@ static void hud_ingame_keyboard(int key, int action, int mods, int internal) {
 						break;
 					case CAMERA_HITTYPE_NONE:
 					default:
-						players[local_player_id].block.red = fog_color[0] * 255;
-						players[local_player_id].block.green = fog_color[1] * 255;
-						players[local_player_id].block.blue = fog_color[2] * 255;
+						players[local_player_id].block.red = fog_color[0] * 255.0F + 0.5F;
+						players[local_player_id].block.green = fog_color[1] * 255.0F + 0.5F;
+						players[local_player_id].block.blue = fog_color[2] * 255.0F + 0.5F;
 						break;
 				}
 				network_updateColor();
@@ -2689,7 +2990,11 @@ static void hud_ingame_keyboard(int key, int action, int mods, int internal) {
 				return;
 			}
 
+#ifdef USE_SDL
+			if(internal == SDLK_x && mods) {
+#else
 			if(internal == 88 /* X */ && mods) {
+#endif
 				if(chat_sel_active()) {
 					chat_sel_copy_to_clipboard();
 					chat_sel_delete();
@@ -2697,7 +3002,11 @@ static void hud_ingame_keyboard(int key, int action, int mods, int internal) {
 				return;
 			}
 
+#ifdef USE_SDL
+			if(internal == SDLK_a && mods) {
+#else
 			if(internal == 65 /* A */ && mods) {
+#endif
 				int len = (int)strlen(chat[0][0]);
 				chat_sel_anchor = 0;
 				chat_cursor = len;
@@ -2988,6 +3297,11 @@ static struct serverlist_news_entry {
 static int serverlist_news_exists = 0;
 static char serverlist_input[128];
 
+static void pinned_load();
+static void pinned_save();
+static int pinned_contains(const char* identifier);
+static void pinned_toggle(const char* identifier);
+
 static void hud_serverlist_init() {
 	ping_stop();
 	network_disconnect();
@@ -3018,12 +3332,24 @@ static void hud_serverlist_init() {
 	memcpy(serverlist_input, settings.last_address, sizeof settings.last_address);
 
 	pthread_mutex_init(&serverlist_lock, NULL);
+	pinned_load();
 	window_textinput(1);
+}
+
+static int compare_pinned(const void* a, const void* b) {
+	struct serverlist_entry* aa = (struct serverlist_entry*)a;
+	struct serverlist_entry* bb = (struct serverlist_entry*)b;
+	if(aa->pinned && !bb->pinned) return -1;
+	if(!aa->pinned && bb->pinned) return 1;
+	return 0;
 }
 
 static int hud_serverlist_sort(const void* a, const void* b) {
 	struct serverlist_entry* aa = (struct serverlist_entry*)a;
 	struct serverlist_entry* bb = (struct serverlist_entry*)b;
+
+	int cp = compare_pinned(a, b);
+	if(cp) return cp;
 
 	if(strcmp(aa->country, "LAN") == 0) {
 		return -1;
@@ -3045,12 +3371,18 @@ static int hud_serverlist_sort_players(const void* a, const void* b) {
 	struct serverlist_entry* aa = (struct serverlist_entry*)a;
 	struct serverlist_entry* bb = (struct serverlist_entry*)b;
 
+	int cp = compare_pinned(a, b);
+	if(cp) return cp;
+
 	return bb->current - aa->current;
 }
 
 static int hud_serverlist_sort_name(const void* a, const void* b) {
 	struct serverlist_entry* aa = (struct serverlist_entry*)a;
 	struct serverlist_entry* bb = (struct serverlist_entry*)b;
+
+	int cp = compare_pinned(a, b);
+	if(cp) return cp;
 
 	return strcmp(aa->name, bb->name);
 }
@@ -3059,6 +3391,9 @@ static int hud_serverlist_sort_map(const void* a, const void* b) {
 	struct serverlist_entry* aa = (struct serverlist_entry*)a;
 	struct serverlist_entry* bb = (struct serverlist_entry*)b;
 
+	int cp = compare_pinned(a, b);
+	if(cp) return cp;
+
 	return strcmp(aa->map, bb->map);
 }
 
@@ -3066,12 +3401,18 @@ static int hud_serverlist_sort_mode(const void* a, const void* b) {
 	struct serverlist_entry* aa = (struct serverlist_entry*)a;
 	struct serverlist_entry* bb = (struct serverlist_entry*)b;
 
+	int cp = compare_pinned(a, b);
+	if(cp) return cp;
+
 	return strcmp(aa->gamemode, bb->gamemode);
 }
 
 static int hud_serverlist_sort_ping(const void* a, const void* b) {
 	struct serverlist_entry* aa = (struct serverlist_entry*)a;
 	struct serverlist_entry* bb = (struct serverlist_entry*)b;
+
+	int cp = compare_pinned(a, b);
+	if(cp) return cp;
 
 	return aa->ping - bb->ping;
 }
@@ -3091,6 +3432,61 @@ static void hud_serverlist_pingupdate(void* e, float time_delta, char* aos) {
 
 	qsort(serverlist, server_count, sizeof(struct serverlist_entry), hud_serverlist_sort);
 	pthread_mutex_unlock(&serverlist_lock);
+}
+
+#define MAX_PINNED 128
+static char pinned_identifiers[MAX_PINNED][32];
+static int pinned_count = 0;
+
+static void pinned_load() {
+	if(!file_exists("pinned_servers.txt")) return;
+	int sz = file_size("pinned_servers.txt");
+	if(sz <= 0) return;
+	char* data = file_load("pinned_servers.txt");
+	if(!data) return;
+	pinned_count = 0;
+	char* p = data;
+	char* end = data + sz;
+	while(p < end && pinned_count < MAX_PINNED) {
+		char* nl = strchr(p, '\n');
+		int len = nl ? (nl - p) : (end - p);
+		if(len > 0 && len < (int)sizeof(pinned_identifiers[0])) {
+			memcpy(pinned_identifiers[pinned_count], p, len);
+			pinned_identifiers[pinned_count][len] = 0;
+			pinned_count++;
+		}
+		p = nl ? nl + 1 : end;
+	}
+	free(data);
+}
+
+static void pinned_save() {
+	void* f = file_open("pinned_servers.txt", "w");
+	if(!f) return;
+	for(int k = 0; k < pinned_count; k++)
+		file_printf(f, "%s\n", pinned_identifiers[k]);
+	file_close(f);
+}
+
+static int pinned_contains(const char* identifier) {
+	for(int k = 0; k < pinned_count; k++)
+		if(!strcmp(pinned_identifiers[k], identifier)) return 1;
+	return 0;
+}
+
+static void pinned_toggle(const char* identifier) {
+	int idx = -1;
+	for(int k = 0; k < pinned_count; k++)
+		if(!strcmp(pinned_identifiers[k], identifier)) { idx = k; break; }
+	if(idx >= 0) {
+		memmove(&pinned_identifiers[idx], &pinned_identifiers[idx + 1],
+				(pinned_count - idx - 1) * sizeof(pinned_identifiers[0]));
+		pinned_count--;
+	} else if(pinned_count < MAX_PINNED) {
+		strncpy(pinned_identifiers[pinned_count], identifier, sizeof(pinned_identifiers[0]) - 1);
+		pinned_count++;
+	}
+	pinned_save();
 }
 
 static void server_c(char* address, char* name) {
@@ -3182,9 +3578,9 @@ static void hud_common_nav(mu_Context* ctx, mu_Rect* frame, float scalex, float 
 		}
 	} else {
 		if(serverlist_is_outdated) {
-			mu_layout_row(ctx, 7, (int[]) {A, B, C, N, D, E, -1}, 0);
+			mu_layout_row(ctx, 8, (int[]) {A, B, C, N, N, D, E, -1}, 0);
 		} else {
-			mu_layout_row(ctx, 6, (int[]) {A, B, C, N, E, -1}, 0);
+			mu_layout_row(ctx, 7, (int[]) {A, B, C, N, N, E, -1}, 0);
 		}
 	}
 
@@ -3194,6 +3590,7 @@ static void hud_common_nav(mu_Context* ctx, mu_Rect* frame, float scalex, float 
 
 	hud_nav_button(ctx, &hud_settings, "Settings");
 	hud_nav_button(ctx, &hud_controls, "Controls");
+	hud_nav_button(ctx, &hud_skins, "Skins");
 	if(!network_connected)
 		hud_nav_button(ctx, &hud_demolist, "Demos");
 
@@ -3330,6 +3727,7 @@ static void hud_serverlist_render(mu_Context* ctx, float scalex, float scaley) {
 		pthread_mutex_lock(&serverlist_lock);
 		if(server_count > 0) {
 			char total_str[128];
+			int serverlist_need_sort = 0;
 			for(int k = 0; k < server_count; k++) {
 				if(serverlist[k].current >= 0)
 					sprintf(total_str, "%i/%i", serverlist[k].current, serverlist[k].max);
@@ -3343,7 +3741,10 @@ static void hud_serverlist_render(mu_Context* ctx, float scalex, float scaley) {
 
 				mu_push_id(ctx, &serverlist[k].identifier, strlen(serverlist[k].identifier));
 
-				mu_text_color(ctx, 230 / f, 230 / f, 230 / f);
+				if(serverlist[k].pinned)
+					mu_text_color(ctx, 255 / f, 220 / f, 0);
+				else
+					mu_text_color(ctx, 230 / f, 230 / f, 230 / f);
 				bool join = false;
 				if(mu_button_ex(ctx, total_str, 0, MU_OPT_NOFRAME | MU_OPT_ALIGNCENTER))
 					join = true;
@@ -3371,6 +3772,22 @@ static void hud_serverlist_render(mu_Context* ctx, float scalex, float scaley) {
 								MU_OPT_NOFRAME | MU_OPT_ALIGNCENTER))
 					join = true;
 
+				if(serverlist[k].pinned) {
+					mu_Container* cnt = mu_get_current_container(ctx);
+					mu_draw_rect(ctx, mu_rect(cnt->body.x, ctx->last_rect.y, cnt->body.w, ctx->last_rect.h),
+								 mu_color(255, 220, 0, 20));
+				}
+
+				if(ctx->mouse_pressed & MU_MOUSE_RIGHT) {
+					mu_Container* cnt = mu_get_current_container(ctx);
+					mu_Rect row_rect = mu_rect(cnt->body.x, ctx->last_rect.y, cnt->body.w, ctx->last_rect.h);
+					if(mu_mouse_over(ctx, row_rect)) {
+						pinned_toggle(serverlist[k].identifier);
+						serverlist[k].pinned = !serverlist[k].pinned;
+						serverlist_need_sort = 1;
+					}
+				}
+
 				mu_pop_id(ctx);
 
 				if(join) {
@@ -3378,6 +3795,8 @@ static void hud_serverlist_render(mu_Context* ctx, float scalex, float scaley) {
 					break;
 				}
 			}
+			if(serverlist_need_sort)
+				qsort(serverlist, server_count, sizeof(struct serverlist_entry), hud_serverlist_sort);
 		} else {
 			mu_layout_row(ctx, 1, (int[]) {-1}, 0);
 			mu_button_ex(ctx, "Fetching servers...", 0, MU_OPT_NOFRAME | MU_OPT_ALIGNCENTER);
@@ -3506,6 +3925,9 @@ static void hud_serverlist_render(mu_Context* ctx, float scalex, float scaley) {
 					player_count += serverlist[k].current;
 				}
 
+				for(int k = 0; k < server_count; k++)
+					serverlist[k].pinned = pinned_contains(serverlist[k].identifier);
+
 				qsort(serverlist, server_count, sizeof(struct serverlist_entry), hud_serverlist_sort);
 				pthread_mutex_unlock(&serverlist_lock);
 
@@ -3548,8 +3970,11 @@ struct hud hud_serverlist = {
 
 /*         HUD_SETTINGS START        */
 
+static int selected_category = 0;
+
 static void hud_settings_init() {
 	memcpy(&settings_tmp, &settings, sizeof(struct RENDER_OPTIONS));
+	selected_category = 0;
 }
 
 static int int_slider_defaults(mu_Context* ctx, struct config_setting* setting) {
@@ -3602,10 +4027,65 @@ static struct texture* hud_settings_ui_images(int icon_id, bool* resize) {
 	}
 }
 
+static void render_setting_row(mu_Context* ctx, struct config_setting* a, int width) {
+	mu_layout_row(ctx, 2, (int[]) {0.65F * width, -1}, 0);
+
+	switch(a->type) {
+		case CONFIG_TYPE_STRING:
+			mu_text(ctx, a->name);
+			mu_textbox(ctx, a->value, a->max + 1);
+			break;
+		case CONFIG_TYPE_INT:
+			if(a->max == 1 && a->min == 0) {
+				mu_text(ctx, a->name);
+				mu_checkbox(ctx, "", a->value);
+			} else if(a->defaults_length > 0) {
+				mu_text(ctx, a->name);
+				int_slider_defaults(ctx, a);
+			} else if(a->max == INT_MAX) {
+				mu_text(ctx, a->name);
+				int_number(ctx, a->value);
+			} else {
+				mu_text(ctx, a->name);
+				int_slider(ctx, a->value, a->min, a->max);
+			}
+			break;
+		case CONFIG_TYPE_FLOAT:
+			mu_text(ctx, a->name);
+			if(a->max == INT_MAX) {
+				mu_number(ctx, a->value, 0.1F);
+				*(float*)a->value = max(a->min, *(float*)a->value);
+			} else {
+				mu_slider(ctx, a->value, a->min, a->max);
+			}
+			break;
+	}
+
+}
+
+static int setting_in_category(struct config_setting* a, int cat) {
+	switch(cat) {
+		case 0:
+			return strcmp(a->category, "Weapon Settings") != 0
+				&& strcmp(a->category, "Weather") != 0
+				&& strcmp(a->category, "Spectator Mode Settings") != 0
+				&& strcmp(a->category, "Graphic Settings") != 0
+				&& strcmp(a->category, "HUD/UI Settings") != 0
+				&& strcmp(a->category, "Chat Settings") != 0;
+		case 1: return strcmp(a->category, "Weapon Settings") == 0;
+		case 2: return strcmp(a->category, "Weather") == 0;
+		case 3: return strcmp(a->category, "Spectator Mode Settings") == 0;
+		case 4: return strcmp(a->category, "Graphic Settings") == 0;
+		case 5: return strcmp(a->category, "HUD/UI Settings") == 0;
+		case 6: return strcmp(a->category, "Chat Settings") == 0;
+		default: return 0;
+	}
+}
+
 static void hud_settings_render(mu_Context* ctx, float scalex, float scaley) {
 	hud_common_render(ctx);
 
-	mu_Rect frame = mu_rect(settings.window_width / 2.F - fminf(1024.F, settings.window_width * 0.75F) / 2.F, 0, fminf(1024.F, settings.window_width * 0.75F), settings.window_height);
+	mu_Rect frame = mu_rect(0, 0, settings.window_width, settings.window_height);
 
 	if(mu_begin_window_ex(ctx, "Main", frame, MU_OPT_NOFRAME | MU_OPT_NOTITLE | MU_OPT_NORESIZE)) {
 		mu_Container* cnt = mu_get_current_container(ctx);
@@ -3613,337 +4093,71 @@ static void hud_settings_render(mu_Context* ctx, float scalex, float scaley) {
 
 		hud_common_nav(ctx, &frame, scalex, scaley);
 
-		mu_layout_row(ctx, 1, (int[]) {-1}, -1);
+		mu_layout_row(ctx, 2, (int[]) {150, -1}, -1);
 
-		mu_begin_panel(ctx, "Content");	
+		mu_begin_panel(ctx, "Categories");
+		mu_layout_row(ctx, 1, (int[]) {-1}, 0);
 
-		if(mu_header_ex(ctx, "KyroSpades Settings", MU_OPT_EXPANDED)) {
-			int width = mu_get_current_container(ctx)->body.w;
+		static const char* cat_names[] = {
+			"General",
+			"Weapons",
+			"Weather",
+			"Spectator",
+			"Graphics",
+			"HUD/UI",
+			"Chat",
+		};
+		int cat_count = sizeof(cat_names) / sizeof(cat_names[0]);
 
-			for(int k = 0; k < list_size(&config_settings); k++) {
-				struct config_setting* a = list_get(&config_settings, k);
-
-				if(strcmp(a->category, "KyroSpades Settings") != 0)
-					continue;
-
-				mu_layout_row(ctx, 3, (int[]) {0.65F * width, -0.05F * width, -1}, 0);
-
-				switch(a->type) {
-					case CONFIG_TYPE_STRING:
-						mu_text(ctx, a->name);
-						mu_textbox(ctx, a->value, a->max + 1);
-						break;
-					case CONFIG_TYPE_INT:
-						if(a->max == 1 && a->min == 0) {
-							mu_text(ctx, a->name);
-							mu_checkbox(ctx, "", a->value);
-						} else if(a->defaults_length > 0) {
-							mu_text(ctx, a->name);
-							int_slider_defaults(ctx, a);
-						} else if(a->max == INT_MAX) {
-							mu_text(ctx, a->name);
-							int_number(ctx, a->value);
-						} else {
-							mu_text(ctx, a->name);
-							int_slider(ctx, a->value, a->min, a->max);
-						}
-						break;
-					case CONFIG_TYPE_FLOAT:
-						mu_text(ctx, a->name);
-						if(a->max == INT_MAX) {
-							mu_number(ctx, a->value, 0.1F);
-							*(float*)a->value = max(a->min, *(float*)a->value);
-						} else {
-							mu_slider(ctx, a->value, a->min, a->max);
-						}
-						break;
-				}
-
-				if(*a->help) {
-					mu_push_id(ctx, &a->value, sizeof(a->value));
-					if(mu_begin_popup(ctx, "Help")) {
-						mu_layout_row(ctx, 1, (int[]) {ctx->text_width(ctx->style->font, a->help, 0)}, 0);
-						mu_text(ctx, a->help);
-						mu_end_popup(ctx);
-					}
-
-					if(mu_button(ctx, "?"))
-						mu_open_popup(ctx, "Help");
-					mu_pop_id(ctx);
-				} else {
-					mu_layout_next(ctx);
-				}
-			}
-
-		}
-
-		if(mu_header_ex(ctx, "Weapon Settings", MU_OPT_EXPANDED)) {
-			int width = mu_get_current_container(ctx)->body.w;
-
-			for(int k = 0; k < list_size(&config_settings); k++) {
-				struct config_setting* a = list_get(&config_settings, k);
-
-				if(strcmp(a->category, "Weapon Settings") != 0)
-					continue;
-
-				mu_layout_row(ctx, 3, (int[]) {0.65F * width, -0.05F * width, -1}, 0);
-
-				switch(a->type) {
-					case CONFIG_TYPE_STRING:
-						mu_text(ctx, a->name);
-						mu_textbox(ctx, a->value, a->max + 1);
-						break;
-					case CONFIG_TYPE_INT:
-						if(a->max == 1 && a->min == 0) {
-							mu_text(ctx, a->name);
-							mu_checkbox(ctx, "", a->value);
-						} else if(a->defaults_length > 0) {
-							mu_text(ctx, a->name);
-							int_slider_defaults(ctx, a);
-						} else if(a->max == INT_MAX) {
-							mu_text(ctx, a->name);
-							int_number(ctx, a->value);
-						} else {
-							mu_text(ctx, a->name);
-							int_slider(ctx, a->value, a->min, a->max);
-						}
-						break;
-					case CONFIG_TYPE_FLOAT:
-						mu_text(ctx, a->name);
-						if(a->max == INT_MAX) {
-							mu_number(ctx, a->value, 0.1F);
-							*(float*)a->value = max(a->min, *(float*)a->value);
-						} else {
-							mu_slider(ctx, a->value, a->min, a->max);
-						}
-						break;
-				}
-
-				if(*a->help) {
-					mu_push_id(ctx, &a->value, sizeof(a->value));
-					if(mu_begin_popup(ctx, "Help")) {
-						mu_layout_row(ctx, 1, (int[]) {ctx->text_width(ctx->style->font, a->help, 0)}, 0);
-						mu_text(ctx, a->help);
-						mu_end_popup(ctx);
-					}
-
-					if(mu_button(ctx, "?"))
-						mu_open_popup(ctx, "Help");
-					mu_pop_id(ctx);
-				} else {
-					mu_layout_next(ctx);
-				}
-			}
-
-		}
-
-		if(mu_header_ex(ctx, "Weather", MU_OPT_EXPANDED)) {
-			int width = mu_get_current_container(ctx)->body.w;
-
-			for(int k = 0; k < list_size(&config_settings); k++) {
-				struct config_setting* a = list_get(&config_settings, k);
-
-				if(strcmp(a->category, "Weather") != 0)
-					continue;
-
-				mu_layout_row(ctx, 3, (int[]) {0.65F * width, -0.05F * width, -1}, 0);
-
-				switch(a->type) {
-					case CONFIG_TYPE_STRING:
-						mu_text(ctx, a->name);
-						mu_textbox(ctx, a->value, a->max + 1);
-						break;
-					case CONFIG_TYPE_INT:
-						if(a->max == 1 && a->min == 0) {
-							mu_text(ctx, a->name);
-							mu_checkbox(ctx, "", a->value);
-						} else if(a->defaults_length > 0) {
-							mu_text(ctx, a->name);
-							int_slider_defaults(ctx, a);
-						} else if(a->max == INT_MAX) {
-							mu_text(ctx, a->name);
-							int_number(ctx, a->value);
-						} else {
-							mu_text(ctx, a->name);
-							int_slider(ctx, a->value, a->min, a->max);
-						}
-						break;
-					case CONFIG_TYPE_FLOAT:
-						mu_text(ctx, a->name);
-						if(a->max == INT_MAX) {
-							mu_number(ctx, a->value, 0.1F);
-							*(float*)a->value = max(a->min, *(float*)a->value);
-						} else {
-							mu_slider(ctx, a->value, a->min, a->max);
-						}
-						break;
-				}
-
-				if(*a->help) {
-					mu_push_id(ctx, &a->value, sizeof(a->value));
-					if(mu_begin_popup(ctx, "Help")) {
-						mu_layout_row(ctx, 1, (int[]) {ctx->text_width(ctx->style->font, a->help, 0)}, 0);
-						mu_text(ctx, a->help);
-						mu_end_popup(ctx);
-					}
-
-					if(mu_button(ctx, "?"))
-						mu_open_popup(ctx, "Help");
-					mu_pop_id(ctx);
-				} else {
-					mu_layout_next(ctx);
-				}
-			}
-
-		}
-
-		if(mu_header_ex(ctx, "Spectator Mode Settings", MU_OPT_EXPANDED)) {
-			int width = mu_get_current_container(ctx)->body.w;
-
-			for(int k = 0; k < list_size(&config_settings); k++) {
-				struct config_setting* a = list_get(&config_settings, k);
-
-				if(strcmp(a->category, "Spectator Mode Settings") != 0)
-					continue;
-
-				mu_layout_row(ctx, 3, (int[]) {0.65F * width, -0.05F * width, -1}, 0);
-
-				switch(a->type) {
-					case CONFIG_TYPE_STRING:
-						mu_text(ctx, a->name);
-						mu_textbox(ctx, a->value, a->max + 1);
-						break;
-					case CONFIG_TYPE_INT:
-						if(a->max == 1 && a->min == 0) {
-							mu_text(ctx, a->name);
-							mu_checkbox(ctx, "", a->value);
-						} else if(a->defaults_length > 0) {
-							mu_text(ctx, a->name);
-							int_slider_defaults(ctx, a);
-						} else if(a->max == INT_MAX) {
-							mu_text(ctx, a->name);
-							int_number(ctx, a->value);
-						} else {
-							mu_text(ctx, a->name);
-							int_slider(ctx, a->value, a->min, a->max);
-						}
-						break;
-					case CONFIG_TYPE_FLOAT:
-						mu_text(ctx, a->name);
-						if(a->max == INT_MAX) {
-							mu_number(ctx, a->value, 0.1F);
-							*(float*)a->value = max(a->min, *(float*)a->value);
-						} else {
-							mu_slider(ctx, a->value, a->min, a->max);
-						}
-						break;
-				}
-
-				if(*a->help) {
-					mu_push_id(ctx, &a->value, sizeof(a->value));
-					if(mu_begin_popup(ctx, "Help")) {
-						mu_layout_row(ctx, 1, (int[]) {ctx->text_width(ctx->style->font, a->help, 0)}, 0);
-						mu_text(ctx, a->help);
-						mu_end_popup(ctx);
-					}
-
-					if(mu_button(ctx, "?"))
-						mu_open_popup(ctx, "Help");
-					mu_pop_id(ctx);
-				} else {
-					mu_layout_next(ctx);
-				}
-			}
-
-		}
-
-		if(mu_header_ex(ctx, "All settings", MU_OPT_EXPANDED)) {
-			int width = mu_get_current_container(ctx)->body.w;
-
-			for(int k = 0; k < list_size(&config_settings); k++) {
-				struct config_setting* a = list_get(&config_settings, k);
-
-				if(strcmp(a->category, "KyroSpades Settings") == 0 || strcmp(a->category, "Weapon Settings") == 0 || strcmp(a->category, "Spectator Mode Settings") == 0 || strcmp(a->category, "Weather") == 0)
-					continue;
-
-				mu_layout_row(ctx, 3, (int[]) {0.65F * width, -0.05F * width, -1}, 0);
-
-				switch(a->type) {
-					case CONFIG_TYPE_STRING:
-						mu_text(ctx, a->name);
-						mu_textbox(ctx, a->value, a->max + 1);
-						break;
-					case CONFIG_TYPE_INT:
-						if(a->max == 1 && a->min == 0) {
-							mu_text(ctx, a->name);
-							mu_checkbox(ctx, "", a->value);
-						} else if(a->defaults_length > 0) {
-							mu_text(ctx, a->name);
-							int_slider_defaults(ctx, a);
-						} else if(a->max == INT_MAX) {
-							mu_text(ctx, a->name);
-							int_number(ctx, a->value);
-						} else {
-							mu_text(ctx, a->name);
-							int_slider(ctx, a->value, a->min, a->max);
-						}
-						break;
-					case CONFIG_TYPE_FLOAT:
-						mu_text(ctx, a->name);
-						if(a->max == INT_MAX) {
-							mu_number(ctx, a->value, 0.1F);
-							*(float*)a->value = max(a->min, *(float*)a->value);
-						} else {
-							mu_slider(ctx, a->value, a->min, a->max);
-						}
-						break;
-				}
-
-				if(*a->help) {
-					mu_push_id(ctx, &a->value, sizeof(a->value));
-					if(mu_begin_popup(ctx, "Help")) {
-						mu_layout_row(ctx, 1, (int[]) {ctx->text_width(ctx->style->font, a->help, 0)}, 0);
-						mu_text(ctx, a->help);
-						mu_end_popup(ctx);
-					}
-
-					if(mu_button(ctx, "?"))
-						mu_open_popup(ctx, "Help");
-					mu_pop_id(ctx);
-				} else {
-					mu_layout_next(ctx);
-				}
-			}
-
-			mu_layout_row(ctx, 3, (int[]) {0.65F * width, -0.05F * width, -1}, 0);
-			mu_layout_next(ctx);
-
-			if(mu_button(ctx, "Apply changes")) {
-				memcpy(&settings, &settings_tmp, sizeof(struct RENDER_OPTIONS));
-				window_fromsettings();
-				sound_volume(settings.volume / 10.0F);
-				config_save();
+		for(int i = 0; i < cat_count; i++) {
+			if(selected_category == i) {
+				mu_Color old_border = ctx->style->colors[MU_COLOR_BORDER];
+				mu_Color old_text = ctx->style->colors[MU_COLOR_TEXT];
+				mu_Color accent = {settings.ui_accent_r, settings.ui_accent_g, settings.ui_accent_b, 255};
+				mu_Color black = {0, 0, 0, 255};
+				ctx->style->colors[MU_COLOR_BORDER] = accent;
+				ctx->style->colors[MU_COLOR_TEXT] = black;
+				mu_button_ex(ctx, cat_names[i], 0, MU_OPT_NOINTERACT);
+				ctx->style->colors[MU_COLOR_TEXT] = old_text;
+				ctx->style->colors[MU_COLOR_BORDER] = old_border;
+			} else {
+				if(mu_button(ctx, cat_names[i]))
+					selected_category = i;
 			}
 		}
 
-		if(mu_header_ex(ctx, "Help", MU_OPT_EXPANDED)) {
-			mu_layout_row(ctx, 1, (int[]) {-1}, -1);
-			mu_text(ctx,
-					"To edit a value directly, [SHIFT]+LMB on its container to change it using the keyboard. You can "
-					"also drag on a container to modify its value relative to its current one.\n\nWhen finished click "
-					"[Apply changes] so that your settings are not lost.");
+		mu_end_panel(ctx);
+
+		mu_begin_panel(ctx, "Settings");
+
+		int width = mu_get_current_container(ctx)->body.w;
+		for(int k = 0; k < list_size(&config_settings); k++) {
+			struct config_setting* a = list_get(&config_settings, k);
+			if(setting_in_category(a, selected_category))
+				render_setting_row(ctx, a, width);
 		}
 
 		mu_end_panel(ctx);
 
 		mu_end_window(ctx);
 	}
+
+	if(memcmp(&settings, &settings_tmp, sizeof(struct RENDER_OPTIONS)) != 0) {
+		int textured_changed = settings.textured_blocks != settings_tmp.textured_blocks;
+		memcpy(&settings, &settings_tmp, sizeof(struct RENDER_OPTIONS));
+		window_fromsettings();
+		sound_volume(settings.volume / 10.0F);
+		config_save();
+		if(textured_changed)
+			chunk_rebuild_all();
+	}
 }
 
-static void hud_settings_keyboard(int key, int action, int mods, int internal)  {
-	if(show_exit && key == WINDOW_KEY_ESCAPE) {
+static void hud_settings_keyboard(int key, int action, int mods, int internal) {
+	if(action == WINDOW_PRESS && show_exit && key == WINDOW_KEY_ESCAPE) {
 		hud_change(&hud_ingame);
-		show_exit = 1;
+		show_exit = 0;
+		window_mousemode(WINDOW_CURSOR_DISABLED);
 	}
 }
 
@@ -3966,6 +4180,208 @@ struct hud hud_settings = {
 	NULL,
 };
 
+
+/*         HUD_SKINS START        */
+
+static int skins_selected_category = 0;
+static int skins_selected_entry[SKIN_CATEGORIES] = {0, 0, 0, 0, 0, 0, 0, 0};
+static int skins_preview_cells_x[256];
+static int skins_preview_cells_y[256];
+static int skins_preview_cat[256];
+static int skins_preview_ent[256];
+static int skins_preview_cell_count = 0;
+
+static void mu_draw_control_frame_inner(mu_Context* ctx, mu_Rect rect, mu_Color color) {
+	mu_draw_rect(ctx, rect, color);
+}
+
+static void hud_skins_init() {
+	skins_selected_category = 0;
+	skins_selected_entry[0] = settings.skin_spade;
+	skins_selected_entry[1] = settings.skin_grenade;
+	skins_selected_entry[2] = settings.skin_rifle;
+	skins_selected_entry[3] = settings.skin_smg;
+	skins_selected_entry[4] = settings.skin_shotgun;
+	skins_selected_entry[6] = settings.skin_intel;
+	skins_selected_entry[7] = settings.skin_tent;
+	skins_scan();
+}
+
+static void hud_skins_render(mu_Context* ctx, float scalex, float scaley) {
+	hud_common_render(ctx);
+
+	mu_Rect frame = mu_rect(0, 0, settings.window_width, settings.window_height);
+
+	if(mu_begin_window_ex(ctx, "Main", frame, MU_OPT_NOFRAME | MU_OPT_NOTITLE | MU_OPT_NORESIZE)) {
+		mu_Container* cnt = mu_get_current_container(ctx);
+		cnt->rect = frame;
+
+		hud_common_nav(ctx, &frame, scalex, scaley);
+
+		mu_layout_row(ctx, 2, (int[]) {150, -1}, -1);
+
+		mu_begin_panel(ctx, "Categories");
+		mu_layout_row(ctx, 1, (int[]) {-1}, 0);
+
+		for(int i = 0; i < SKIN_CATEGORIES; i++) {
+			if(i == SKIN_PLAYER) continue;
+			mu_Color old_border = ctx->style->colors[MU_COLOR_BORDER];
+			mu_Color old_text = ctx->style->colors[MU_COLOR_TEXT];
+			mu_Color accent = {settings.ui_accent_r, settings.ui_accent_g, settings.ui_accent_b, 255};
+			ctx->style->colors[MU_COLOR_BORDER] = accent;
+			if(skins_selected_category == i) {
+				ctx->style->colors[MU_COLOR_TEXT] = (mu_Color){0, 0, 0, 255};
+				mu_button_ex(ctx, skin_categories[i].label, 0, MU_OPT_NOINTERACT);
+			} else {
+				ctx->style->colors[MU_COLOR_TEXT] = (mu_Color){255, 255, 255, 255};
+				if(mu_button(ctx, skin_categories[i].label))
+					skins_selected_category = i;
+			}
+			ctx->style->colors[MU_COLOR_TEXT] = old_text;
+			ctx->style->colors[MU_COLOR_BORDER] = old_border;
+		}
+
+		mu_end_panel(ctx);
+
+		mu_begin_panel(ctx, "Skins");
+		struct skin_category* cat = &skin_categories[skins_selected_category];
+
+		if(cat->count > 0) {
+			int cell_w = 140 * scalex;
+			int cell_h = 160 * scaley;
+			int panel_w = mu_get_current_container(ctx)->body.w;
+			int cols = panel_w / cell_w;
+			if(cols < 1) cols = 1;
+
+			int widths[cols];
+			for(int c = 0; c < cols; c++)
+				widths[c] = panel_w / cols;
+
+			int font_h = ctx->text_height(ctx->style->font);
+
+			mu_layout_row(ctx, cols, widths, cell_h);
+
+			skins_preview_cell_count = 0;
+
+			for(int i = 0; i < cat->count; i++) {
+				if(skins_preview_cell_count >= 256)
+					break;
+
+				mu_push_id(ctx, &i, sizeof(i));
+
+				mu_layout_begin_column(ctx);
+
+				mu_layout_row(ctx, 1, (int[]) {-1}, cell_h);
+
+				int is_selected = (skins_selected_entry[skins_selected_category] == i);
+
+				mu_Color old_button = ctx->style->colors[MU_COLOR_BUTTON];
+				mu_Color old_border = ctx->style->colors[MU_COLOR_BORDER];
+				mu_Color old_text = ctx->style->colors[MU_COLOR_TEXT];
+
+				if(is_selected) {
+					ctx->style->colors[MU_COLOR_BORDER] = (mu_Color){255, 255, 0, 255};
+					ctx->style->colors[MU_COLOR_BUTTON] = (mu_Color){0, 0, 0, 60};
+				} else {
+					ctx->style->colors[MU_COLOR_BORDER] = (mu_Color){settings.ui_accent_r, settings.ui_accent_g, settings.ui_accent_b, 255};
+					ctx->style->colors[MU_COLOR_BUTTON] = (mu_Color){0, 0, 0, 30};
+				}
+
+				if(mu_button_ex(ctx, "", 0, MU_OPT_ALIGNCENTER)) {
+					if(skins_apply(skins_selected_category, i, 1) == 0) {
+						skins_selected_entry[skins_selected_category] = i;
+						switch(skins_selected_category) {
+							case SKIN_SPADE: settings.skin_spade = i; break;
+							case SKIN_GRENADE: settings.skin_grenade = i; break;
+							case SKIN_RIFLE: settings.skin_rifle = i; break;
+							case SKIN_SMG: settings.skin_smg = i; break;
+							case SKIN_SHOTGUN: settings.skin_shotgun = i; break;
+							case SKIN_INTEL: settings.skin_intel = i; break;
+							case SKIN_TENT: settings.skin_tent = i; break;
+						}
+						config_save();
+					}
+				}
+
+				ctx->style->colors[MU_COLOR_BUTTON] = old_button;
+				ctx->style->colors[MU_COLOR_BORDER] = old_border;
+
+				mu_Rect r = ctx->last_rect;
+
+				if(r.w > 0 && r.h > 0) {
+					int name_overlay_h = font_h + ctx->style->padding * 2;
+					mu_Rect name_rect = {r.x, r.y + r.h - name_overlay_h, r.w, name_overlay_h};
+					mu_draw_rect(ctx, name_rect, (mu_Color){0, 0, 0, 140});
+					ctx->style->colors[MU_COLOR_TEXT] = (mu_Color){255, 255, 255, 255};
+					mu_draw_control_text(ctx, cat->entries[i].name, name_rect, MU_COLOR_TEXT, MU_OPT_ALIGNCENTER);
+					ctx->style->colors[MU_COLOR_TEXT] = old_text;
+
+					skins_preview_cells_x[skins_preview_cell_count] = r.x + r.w / 2;
+					int model_area_h = r.h - name_overlay_h;
+					skins_preview_cells_y[skins_preview_cell_count] = settings.window_height - (r.y + model_area_h * 0.4F);
+					skins_preview_cat[skins_preview_cell_count] = skins_selected_category;
+					skins_preview_ent[skins_preview_cell_count] = i;
+					skins_preview_cell_count++;
+				}
+
+				mu_layout_end_column(ctx);
+
+				mu_pop_id(ctx);
+			}
+		} else {
+			mu_layout_row(ctx, 1, (int[]) {-1}, 0);
+			mu_text(ctx, "No skins found for this weapon");
+		}
+
+		mu_end_panel(ctx);
+
+		mu_end_window(ctx);
+	}
+
+	for(int k = 0; k < skins_preview_cell_count; k++) {
+		skins_render_preview(skins_preview_cat[k], skins_preview_ent[k],
+			skins_preview_cells_x[k], skins_preview_cells_y[k],
+			100.0F * scalex);
+	}
+}
+
+static void hud_skins_keyboard(int key, int action, int mods, int internal) {
+	if(action == WINDOW_PRESS && show_exit && key == WINDOW_KEY_ESCAPE) {
+		hud_change(&hud_ingame);
+		show_exit = 0;
+		window_mousemode(WINDOW_CURSOR_DISABLED);
+	}
+}
+
+static void hud_skins_touch(void* finger, int action, float x, float y, float dx, float dy) {
+	window_setmouseloc(x, y);
+}
+
+static struct texture* hud_skins_ui_images(int icon_id, bool* resize) {
+	switch(icon_id) {
+		case MU_ICON_CHECK: return &texture_ui_box_check;
+		case MU_ICON_EXPANDED: return &texture_ui_expanded;
+		case MU_ICON_COLLAPSED: return &texture_ui_collapsed;
+		default: return NULL;
+	}
+}
+
+struct hud hud_skins = {
+	hud_skins_init,
+	NULL,
+	hud_skins_render,
+	hud_skins_keyboard,
+	NULL,
+	NULL,
+	NULL,
+	hud_skins_touch,
+	hud_skins_ui_images,
+	0,
+	0,
+	NULL,
+};
+
+
 /*         HUD_CONTROLS START        */
 
 static struct config_key_pair* hud_controls_edit;
@@ -3977,11 +4393,18 @@ static void hud_controls_init() {
 int demo_list_files(char*** out);
 static char** demo_files = NULL;
 static int    demo_file_count = 0;
+
+static int demo_delete_index = -1;
+static int demo_rename_index = -1;
+static char demo_rename_buf[256];
+
 static void hud_demolist_init(void) {
 	if(!hud_demolist.ctx) hud_demolist.ctx = malloc(sizeof(mu_Context));
+	hud_skins.ctx = malloc(sizeof(mu_Context));
 	if(demo_files) { for(int i = 0; i < demo_file_count; i++) free(demo_files[i]); free(demo_files); demo_files = NULL; }
 	demo_file_count = demo_list_files(&demo_files);
 }
+
 static void hud_demolist_render(mu_Context* ctx, float scalex, float scaley) {
 	hud_common_render(ctx);
 	mu_Rect frame = mu_rect(settings.window_width/2.F - fminf(1024.F,settings.window_width*0.75F)/2.F, 0,
@@ -4000,14 +4423,29 @@ static void hud_demolist_render(mu_Context* ctx, float scalex, float scaley) {
 		for(int i = 0; i < demo_file_count; i++) {
 			const char* slash = strrchr(demo_files[i], '/');
 			const char* name = slash ? slash+1 : demo_files[i];
-			mu_layout_row(ctx, 1, (int[]) {-1}, 0);
 			mu_push_id(ctx, &i, sizeof(i));
+			int bw = ctx->text_width(ctx->style->font, "Delete", 0) * 1.6F;
+			int sp = ctx->style->spacing;
+			mu_layout_row(ctx, 3, (int[]) {-(bw * 2 + sp * 3 + 1), bw, bw}, 0);
 			if(mu_button_ex(ctx, name, 0, MU_OPT_NOFRAME)) {
 				if(demo_playback_open(demo_files[i])) {
-					hud_change(&hud_ingame);
+					/* Initialize game state for demo playback */
 					camera_mode = CAMERAMODE_SPECTATOR;
 					cameracontroller_reset_spectator_velocity();
+					/* Process initial packets to load map and set up world state */
+					network_update();
+					hud_change(&hud_ingame);
 				}
+			}
+			if(mu_button_ex(ctx, "Delete", 0, MU_OPT_NOFRAME)) {
+				demo_delete_index = i;
+			}
+			if(mu_button_ex(ctx, "Rename", 0, MU_OPT_NOFRAME)) {
+				demo_rename_index = i;
+				const char* slash2 = strrchr(demo_files[i], '/');
+				const char* base = slash2 ? slash2+1 : demo_files[i];
+				strncpy(demo_rename_buf, base, sizeof(demo_rename_buf) - 1);
+				demo_rename_buf[sizeof(demo_rename_buf) - 1] = 0;
 			}
 			mu_pop_id(ctx);
 		}
@@ -4017,6 +4455,69 @@ static void hud_demolist_render(mu_Context* ctx, float scalex, float scaley) {
 				0, MU_OPT_NOFRAME|MU_OPT_ALIGNCENTER|MU_OPT_NOINTERACT);
 		}
 		mu_end_panel(ctx); mu_end_window(ctx);
+	}
+
+	/* --- Delete confirm dialog --- */
+	if(demo_delete_index >= 0 && demo_delete_index < demo_file_count) {
+		if(mu_begin_window_ex(ctx, "Confirm Delete", mu_rect(0, 0, 320, 130),
+			 MU_OPT_HOLDFOCUS | MU_OPT_NORESIZE | MU_OPT_NOCLOSE)) {
+			mu_Container* cnt = mu_get_current_container(ctx);
+			mu_bring_to_front(ctx, cnt);
+			cnt->rect = mu_rect((settings.window_width - 320) / 2, 280, 320, 130);
+			mu_layout_row(ctx, 1, (int[]) {-1}, -ctx->text_height(ctx->style->font) * 1.5F);
+			mu_text(ctx, "Are you sure you want to delete this demo?");
+			int bw = ctx->text_width(ctx->style->font, "Yes", 0) * 1.6F;
+			mu_layout_row(ctx, 2, (int[]) {-bw, -1}, 0);
+			if(mu_button(ctx, "Yes")) {
+				remove(demo_files[demo_delete_index]);
+				demo_delete_index = -1;
+				hud_demolist_init();
+			}
+			if(mu_button(ctx, "No")) {
+				demo_delete_index = -1;
+			}
+			mu_end_window(ctx);
+		}
+	}
+
+	/* --- Rename dialog --- */
+	if(demo_rename_index >= 0 && demo_rename_index < demo_file_count) {
+		if(mu_begin_window_ex(ctx, "Rename Demo", mu_rect(0, 0, 400, 130),
+			 MU_OPT_HOLDFOCUS | MU_OPT_NORESIZE | MU_OPT_NOCLOSE)) {
+			mu_Container* cnt = mu_get_current_container(ctx);
+			mu_bring_to_front(ctx, cnt);
+			cnt->rect = mu_rect((settings.window_width - 400) / 2, 280, 400, 130);
+			mu_layout_row(ctx, 1, (int[]) {-1}, -ctx->text_height(ctx->style->font) * 1.5F);
+			mu_text(ctx, "Enter new name for the demo file:");
+			mu_layout_row(ctx, 1, (int[]) {-1}, 0);
+			int res = mu_textbox(ctx, demo_rename_buf, sizeof(demo_rename_buf));
+			int bw = ctx->text_width(ctx->style->font, "Rename", 0) * 1.6F;
+			mu_layout_row(ctx, 2, (int[]) {-bw, -1}, 0);
+			if(mu_button(ctx, "Rename") || (res & MU_RES_SUBMIT)) {
+				const char* slash = strrchr(demo_files[demo_rename_index], '/');
+				char new_path[512];
+				if(slash) {
+					int dir_len = slash - demo_files[demo_rename_index];
+					memcpy(new_path, demo_files[demo_rename_index], dir_len);
+					new_path[dir_len] = '/';
+					new_path[dir_len + 1] = 0;
+				} else {
+					new_path[0] = 0;
+				}
+				char* ext = strrchr(demo_rename_buf, '.');
+				if(!ext || strcmp(ext, ".demo") != 0) {
+					strncat(demo_rename_buf, ".demo", sizeof(demo_rename_buf) - strlen(demo_rename_buf) - 1);
+				}
+				strncat(new_path, demo_rename_buf, sizeof(new_path) - strlen(new_path) - 1);
+				rename(demo_files[demo_rename_index], new_path);
+				demo_rename_index = -1;
+				hud_demolist_init();
+			}
+			if(mu_button(ctx, "Cancel")) {
+				demo_rename_index = -1;
+			}
+			mu_end_window(ctx);
+		}
 	}
 }
 static void hud_demolist_keyboard(int key, int action, int mods, int internal) {
@@ -4082,14 +4583,23 @@ static void hud_controls_render(mu_Context* ctx, float scalex, float scaley) {
 					mu_pop_id(ctx);
 
 					mu_push_id(ctx, a->name, sizeof(a->name));
-					if(mu_begin_popup(ctx, "Help")) {
-						mu_layout_row(ctx, 1, (int[]) {ctx->text_width(ctx->style->font, a->name, 0)}, 0);
+					int pw = ctx->text_width(ctx->style->font, a->name, 0) + ctx->style->padding * 4;
+					int ph = ctx->style->size.y + ctx->style->padding * 4 + ctx->style->title_height;
+					if(mu_begin_window_ex(ctx, "Help",
+										  mu_rect((settings.window_width - pw) / 2,
+												  (settings.window_height - ph) / 2, pw, ph),
+										  MU_OPT_AUTOSIZE | MU_OPT_NORESIZE | MU_OPT_NOSCROLL | MU_OPT_POPUP | MU_OPT_CLOSED)) {
+				mu_layout_row(ctx, 1, (int[]) {-1}, 0);
 						mu_text(ctx, a->name);
-						mu_end_popup(ctx);
+						mu_end_window(ctx);
 					}
-
-					if(mu_button(ctx, "?"))
+					if(mu_button(ctx, "?")) {
 						mu_open_popup(ctx, "Help");
+						mu_Container* cnt = mu_get_container(ctx, "Help");
+						if(cnt)
+							cnt->rect = mu_rect((settings.window_width - pw) / 2,
+												(settings.window_height - ph) / 2, pw, ph);
+					}
 					mu_pop_id(ctx);
 				}
 			}
@@ -4112,9 +4622,10 @@ static void hud_controls_keyboard(int key, int action, int mods, int internal) {
 		config_save();
 	}
 
-	if(show_exit && key == WINDOW_KEY_ESCAPE) {
+	if(action == WINDOW_PRESS && show_exit && key == WINDOW_KEY_ESCAPE) {
 		hud_change(&hud_ingame);
-		show_exit = 1;
+		show_exit = 0;
+		window_mousemode(WINDOW_CURSOR_DISABLED);
 	}
 }
 

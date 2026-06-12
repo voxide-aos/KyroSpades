@@ -99,7 +99,8 @@ enum window_keys {
 	WINDOW_KEY_DEMO_SEEK_BACK,
 	WINDOW_KEY_DEMO_SEEK_FWD,
 	WINDOW_KEY_DEMO_SPEED_DOWN,
-	WINDOW_KEY_DEMO_SPEED_UP
+	WINDOW_KEY_DEMO_SPEED_UP,
+	WINDOW_KEY_MAP_ZOOM
 };
 
 enum {
@@ -146,6 +147,7 @@ void window_setmouseloc(double x, double y);
 void window_swapping(int value);
 void window_init(void);
 void window_fromsettings(void);
+void window_apply(void);
 void window_deinit(void);
 void window_update(void);
 int window_closed(void);

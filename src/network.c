@@ -37,17 +37,20 @@
 #include "particle.h"
 #include "texture.h"
 #include "chunk.h"
+#include "skins.h"
 #include "gmi.h"
 #include "config.h"
 #include "demo.h"
+#include "window.h"
 
 void (*packets[256])(void* data, int len) = {NULL};
 
 int network_connected = 0;
 int network_logged_in = 0;
 int network_map_transfer = 0;
-int network_received_packets = 0;
+int network_map_transfer_end = 0;
 int network_map_cached = 0;
+int network_received_packets = 0;
 char network_current_ip[64] = {0};
 int  network_current_port = 0;
 
@@ -249,6 +252,9 @@ void read_PacketBlockAction(void* data, int len) {
 			break;
 		case ACTION_BUILD:
 			if(p->player_id < PLAYERS_MAX) {
+				if(settings.player_stats && p->player_id == local_player_id) {
+					player_stats_blocks_placed++;
+				}
 				bool play_sound = map_isair(p->x, 63 - p->z, p->y);
 
 				map_set(p->x, 63 - p->z, p->y,
@@ -266,6 +272,15 @@ void read_PacketBlockLine(void* data, int len) {
 	struct PacketBlockLine* p = (struct PacketBlockLine*)data;
 	if(p->player_id >= PLAYERS_MAX) {
 		return;
+	}
+	if(settings.player_stats && p->player_id == local_player_id) {
+		if(p->sx == p->ex && p->sy == p->ey && p->sz == p->ez) {
+			player_stats_blocks_placed++;
+		} else {
+			struct Point blocks[64];
+			int blen = map_cube_line(p->sx, p->sy, p->sz, p->ex, p->ey, p->ez, blocks);
+			player_stats_blocks_placed += blen;
+		}
 	}
 	if(p->sx == p->ex && p->sy == p->ey && p->sz == p->ez) {
 		map_set(p->sx, 63 - p->sz, p->sy,
@@ -348,7 +363,7 @@ void read_PacketStateData(void* data, int len) {
 		camera_mode = CAMERAMODE_SELECTION;
 		screen_current = SCREEN_TEAM_SELECT;
 	}
-	network_map_transfer = 0;
+	network_map_transfer_end = 1;
 	chat_popup_duration = 0;
 
 	log_info("map data was %i bytes", compressed_chunk_data_offset);
@@ -368,6 +383,7 @@ void read_PacketStateData(void* data, int len) {
 				CHECK_ALLOCATION_ERROR(decompressed)
 			}
 			if(r == LIBDEFLATE_SUCCESS) {
+				log_debug("Map decompressed: %zu bytes", decompressed_size);
 				demo_playback_save_initial_map(decompressed, decompressed_size);
 				if(!demo_is_seeking())
 					map_vxl_load(decompressed, decompressed_size);
@@ -382,13 +398,16 @@ void read_PacketStateData(void* data, int len) {
 				chunk_rebuild_all();
 				break;
 			}
-			if(r == LIBDEFLATE_BAD_DATA || r == LIBDEFLATE_SHORT_OUTPUT)
+			if(r == LIBDEFLATE_BAD_DATA || r == LIBDEFLATE_SHORT_OUTPUT) {
+				log_debug("Map decompression failed: r=%i", r);
 				break;
+			}
 		}
 free(decompressed);
 		libdeflate_free_decompressor(d);
 	}
 	compressed_chunk_data_offset = 0;
+	skins_apply_all(0);
 }
 void read_PacketFogColor(void* data, int len) {
 	struct PacketFogColor* p = (struct PacketFogColor*)data;
@@ -402,12 +421,14 @@ void read_PacketExistingPlayer(void* data, int len) {
 	if(p->player_id < PLAYERS_MAX) {
 		if(!players[p->player_id].connected)
 			printJoinMsg(p->team, p->name);
+		player_save_corpse(p->player_id);
 		player_reset(&players[p->player_id]);
 		players[p->player_id].connected = 1;
 		players[p->player_id].alive = 1;
 		players[p->player_id].team = p->team;
 		players[p->player_id].weapon = p->weapon;
 		players[p->player_id].held_item = p->held_item;
+		player_on_held_item_change(&players[p->player_id]);
 		players[p->player_id].score = p->kills;
 		players[p->player_id].block.red = p->red;
 		players[p->player_id].block.green = p->green;
@@ -423,11 +444,14 @@ void read_PacketCreatePlayer(void* data, int len) {
 	if(p->player_id < PLAYERS_MAX) {
 		if(!players[p->player_id].connected)
 			printJoinMsg(p->team, p->name);
+		player_save_corpse(p->player_id);
+		log_debug("Player created: id=%i name=%s team=%i", p->player_id, p->name, p->team);
 		player_reset(&players[p->player_id]);
 		players[p->player_id].connected = 1;
 		players[p->player_id].alive = 1;
 		players[p->player_id].team = p->team;
 		players[p->player_id].held_item = TOOL_GUN;
+		player_on_held_item_change(&players[p->player_id]);
 		players[p->player_id].weapon = p->weapon;
 		players[p->player_id].pos.x = p->x;
 		players[p->player_id].pos.y = 63.0F - p->z;
@@ -462,6 +486,7 @@ void read_PacketCreatePlayer(void* data, int len) {
 			local_player_grenades = 3;
 			local_player_lasttool = TOOL_GUN;
 			weapon_set(false);
+			skins_apply_all(0);
 		}
 	}
 }
@@ -469,6 +494,8 @@ void read_PacketCreatePlayer(void* data, int len) {
 void read_PacketPlayerLeft(void* data, int len) {
 	struct PacketPlayerLeft* p = (struct PacketPlayerLeft*)data;
 	if(p->player_id < PLAYERS_MAX) {
+		log_debug("Player left: id=%i name=%s", p->player_id, players[p->player_id].name);
+		player_save_corpse(p->player_id);
 		players[p->player_id].connected = 0;
 		players[p->player_id].alive = 0;
 		players[p->player_id].score = 0;
@@ -482,6 +509,7 @@ void read_PacketPlayerLeft(void* data, int len) {
 
 void read_PacketMapStart(void* data, int len) {
 	if(demo_is_seeking()) return;
+	player_clear_corpses();
 	// ffs someone fix the wrong map size of 1.5mb
 	if(compressed_chunk_data) {
 		free(compressed_chunk_data);
@@ -492,6 +520,7 @@ void read_PacketMapStart(void* data, int len) {
 	CHECK_ALLOCATION_ERROR(compressed_chunk_data)
 	compressed_chunk_data_offset = 0;	network_logged_in = 0;
 	network_map_transfer = 1;
+	network_map_transfer_end = 0;
 	network_map_cached = 0;
 
 	if(len == sizeof(struct PacketMapStart075)) {
@@ -502,12 +531,14 @@ void read_PacketMapStart(void* data, int len) {
 		compressed_chunk_data_estimate = p->map_size;
 		log_info("map name: %s", p->map_name);
 		log_info("map crc32: 0x%08X", p->crc32);
+		log_debug("Map transfer started: name=%s, crc=0x%08X, size=%i", p->map_name, p->crc32, p->map_size);
 		char filename[128];
 		sprintf(filename, "cache/%02X%02X%02X%02X.vxl", red(p->crc32), green(p->crc32), blue(p->crc32),
 				alpha(p->crc32));
 		log_info("%s", filename);
 		if(file_exists(filename)) {
 			network_map_cached = 1;
+			log_debug("Map cache hit: loading from %s", filename);
 			void* mapd = file_load(filename);
 			map_vxl_load(mapd, file_size(filename));
 			free(mapd);
@@ -551,7 +582,7 @@ void read_PacketWorldUpdate(void* data, int len) {
 						= (struct PacketWorldUpdate076*)(data + k * sizeof(struct PacketWorldUpdate076));
 					if(players[p->player_id].connected && players[p->player_id].alive
 					   && p->player_id != local_player_id) {
-						if(distance3D(players[k].pos.x, players[k].pos.y, players[k].pos.z, p->x, 63.0F - p->z, p->y)
+						if(distance3D(players[p->player_id].pos.x, players[p->player_id].pos.y, players[p->player_id].pos.z, p->x, 63.0F - p->z, p->y)
 						   > 0.1F * 0.1F) {
 							players[p->player_id].pos.x = p->x;
 							players[p->player_id].pos.y = 63.0F - p->z;
@@ -605,8 +636,10 @@ void read_PacketWeaponInput(void* data, int len) {
 	if(p->player_id < PLAYERS_MAX && p->player_id != local_player_id) {
 		players[p->player_id].input.buttons.lmb = p->primary;
 		players[p->player_id].input.buttons.rmb = p->secondary;
-		if(p->primary)
+		if(p->primary) {
 			players[p->player_id].input.buttons.lmb_start = window_time();
+			players[p->player_id].weapon_last_shot = window_time();
+		}
 		if(p->secondary)
 			players[p->player_id].input.buttons.rmb_start = window_time();
 	}
@@ -616,6 +649,7 @@ void read_PacketSetTool(void* data, int len) {
 	struct PacketSetTool* p = (struct PacketSetTool*)data;
 	if(p->player_id < PLAYERS_MAX && p->tool < 4) {
 		players[p->player_id].held_item = p->tool;
+		player_on_held_item_change(&players[p->player_id]);
 	}
 }
 
@@ -643,9 +677,24 @@ void read_PacketKillAction(void* data, int len) {
 		players[p->player_id].alive = 0;
 		players[p->player_id].input.keys.packed = 0;
 		players[p->player_id].input.buttons.packed = 0;
+		player_save_corpse(p->player_id);
+		log_debug("Player %i killed by %i (type %i)", p->player_id, p->killer_id, p->kill_type);
 		if(p->player_id != p->killer_id) {
 			players[p->killer_id].score++;
 		}
+
+		if(settings.player_stats) {
+			if(p->killer_id == local_player_id) {
+				player_stats_kills++;
+				if(p->kill_type == KILLTYPE_HEADSHOT) {
+					player_stats_headshots++;
+				}
+			}
+			if(p->player_id == local_player_id) {
+				player_stats_deaths++;
+			}
+		}
+
 		char* gun_name[3] = {"Rifle", "SMG", "Shotgun"};
 		char m[256];
 
@@ -725,6 +774,7 @@ void read_PacketRestock(void* data, int len) {
 	local_player_blocks = 50;
 	local_player_grenades = 3;
 	weapon_set(true);
+	skins_apply_all(0);
 	if(!demo_mute_effects())
 		sound_create(SOUND_LOCAL, &sound_switch, 0.0F, 0.0F, 0.0F);
 }
@@ -1002,14 +1052,14 @@ void network_updateColor() {
 	network_send(PACKET_SETCOLOR_ID, &c, sizeof(c));
 }
 
-unsigned char network_send_tmp[512];
 void network_send(int id, void* data, int len) {
 	if(demo_is_playing()) return;
 	if(network_connected) {
 		network_stats[0].outgoing += len + 1;
-		network_send_tmp[0] = id;
-		memcpy(network_send_tmp + 1, data, len);
-		enet_peer_send(peer, 0, enet_packet_create(network_send_tmp, len + 1, ENET_PACKET_FLAG_RELIABLE));
+		unsigned char tmp[512];
+		tmp[0] = id;
+		memcpy(tmp + 1, data, len);
+		enet_peer_send(peer, 0, enet_packet_create(tmp, len + 1, ENET_PACKET_FLAG_RELIABLE));
 	}
 }
 
@@ -1022,10 +1072,13 @@ void network_disconnect() {
 		demo_playback_close();
 		return;
 	}
+	player_stats_reset();
 	if(network_connected) {
 		enet_peer_disconnect(peer, 0);
 		network_connected = 0;
 		network_logged_in = 0;
+		network_map_transfer_end = 0;
+		player_clear_corpses();
 		/* Belt-and-braces: the live chat ring belongs to the just-closed
 		   session. server_c also calls chat_clear on the next connect,
 		   but clearing here too prevents any UI that runs in the
@@ -1068,6 +1121,7 @@ int network_connect_sub(char* ip, int port, int version) {
 		strncpy(network_current_ip, ip, sizeof(network_current_ip) - 1);
 		network_current_ip[sizeof(network_current_ip) - 1] = 0;
 		network_current_port = port;
+		log_debug("Connected to %s:%i (version %i)", ip, port, version);
 
 		float start = window_time();
 		while(window_time() - start < 1.0F) { // listen connection for 1s, check if server disconnects
@@ -1079,6 +1133,7 @@ int network_connect_sub(char* ip, int port, int version) {
 		return 1;
 	}
 	chat_showpopup("No response", 3.0F, rgb(255, 0, 0));
+	log_debug("Connection to %s:%i failed: no response from server", ip, port);
 	enet_peer_reset(peer);
 	return 0;
 }
@@ -1137,6 +1192,7 @@ int network_connect_string(char* addr) {
 int network_update() {
 	if(demo_is_playing()) {
 		demo_playback_update();
+		chunk_queue_blocks();
 		return 1;
 	}
 	if(network_connected) {
@@ -1177,6 +1233,8 @@ int network_update() {
 					event.peer->data = NULL;
 					network_connected = 0;
 					network_logged_in = 0;
+					network_map_transfer_end = 0;
+					player_clear_corpses();
 					return 0;
 			}
 		}

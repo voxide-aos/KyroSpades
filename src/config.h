@@ -72,6 +72,7 @@ extern struct RENDER_OPTIONS {
 	int chat_mention_b;
 	float spectator_speed;
 	float spectator_acceleration;
+	float spectator_fog_distance;
 	int iron_sight;
 	int gmi;
 	int disable_raw_input;
@@ -84,10 +85,29 @@ extern struct RENDER_OPTIONS {
 	float rifle_ads_fov;
 	float shotgun_ads_fov;
 	float smg_ads_fov;
+	int disable_corpse_despawn;
 	int auto_demo_recording;
+	int player_stats;
+	int player_technical_stats;
 	int rain;
 	int snow;
-	int snow_3d;
+	int rain_snow_3d;
+	float exposure;
+	float saturation;
+	float contrast;
+	float vignette;
+	int disable_dynamic_fov;
+	int textured_blocks;
+	int minimap_zoom;
+	int skin_spade;
+	int skin_grenade;
+	int skin_rifle;
+	int skin_smg;
+	int skin_shotgun;
+	int skin_player;
+	int skin_intel;
+	int skin_tent;
+	int debug_log;
 } settings, settings_tmp;
 
 extern struct list config_keys;

@@ -24,6 +24,7 @@
 #include "common.h"
 #include "sound.h"
 #include "config.h"
+#include "file.h"
 #include "log.h"
 #include "camera.h"
 #include "entitysystem.h"
@@ -100,6 +101,8 @@ struct Sound_wav sound_impact;
 struct Sound_wav sound_zoomin;
 struct Sound_wav sound_zoomout;
 
+struct Sound_wav sound_screenshot;
+
 void sound_volume(float vol) {
 #ifdef USE_SOUND
 	if(sound_enabled)
@@ -130,14 +133,15 @@ static void sound_createEx(enum sound_space option, struct Sound_wav* w, float x
 		if(w == &sound_rifle_shoot || w == &sound_smg_shoot || w == &sound_shotgun_shoot) {
 			// Random pitch variation between 0.9 and 1.1 (±10%)
 			pitch = 0.9F + (ms_rand() / 32767.0F) * 0.2F;
-			// Random gain variation between 0.85 and 1.0 (±7.5%)
-			gain = 0.85F + (ms_rand() / 32767.0F) * 0.15F;
+			// Higher source gain so gunfire carries across the map (like OpenSpades)
+			gain = 3.0F;
 		}
 		
 		alSourcef(s.openal_handle, AL_PITCH, pitch);
 		alSourcef(s.openal_handle, AL_GAIN, gain);
-		alSourcef(s.openal_handle, AL_REFERENCE_DISTANCE, s.local ? 0.0F : w->min * SOUND_SCALE);
-		alSourcef(s.openal_handle, AL_MAX_DISTANCE, s.local ? 2048.0F : w->max * SOUND_SCALE);
+		alSourcef(s.openal_handle, AL_REFERENCE_DISTANCE, s.local ? 0.0F : 15.0F);
+		alSourcef(s.openal_handle, AL_MAX_DISTANCE, s.local ? 2048.0F : 1e10F);
+		alSourcef(s.openal_handle, AL_ROLLOFF_FACTOR, s.local ? 0.0F : 1.0F);
 		alSource3f(s.openal_handle, AL_POSITION, s.local ? 0.0F : x * SOUND_SCALE, s.local ? 0.0F : y * SOUND_SCALE,
 				   s.local ? 0.0F : z * SOUND_SCALE);
 		alSource3f(s.openal_handle, AL_VELOCITY, s.local ? 0.0F : vx * SOUND_SCALE, s.local ? 0.0F : vy * SOUND_SCALE,
@@ -231,6 +235,41 @@ void sound_update() {
 extern short* drwav_open_and_read_file_s16(const char* filename, unsigned int* channels, unsigned int* sampleRate,
 										   uint64_t* totalFrameCount);
 
+int sound_reload(struct Sound_wav* wav, const char* name, float min, float max) {
+#ifdef USE_SOUND
+	if(!sound_enabled)
+		return 0;
+	if(!file_exists(name))
+		return -1;
+	if(wav->openal_buffer)
+		alDeleteBuffers(1, (ALuint*)&wav->openal_buffer);
+	unsigned int channels, samplerate;
+	uint64_t samplecount;
+	short* samples = drwav_open_and_read_file_s16(name, &channels, &samplerate, &samplecount);
+	if(samples == NULL) {
+		wav->openal_buffer = 0;
+		return -1;
+	}
+	short* audio;
+	if(channels > 1) {
+		audio = malloc(samplecount * sizeof(short) / 2);
+		if(!audio) { free(samples); return -1; }
+		for(uint64_t k = 0; k < samplecount / 2; k++)
+			audio[k] = ((int)samples[k * 2] + (int)samples[k * 2 + 1]) / 2;
+		free(samples);
+	}
+	alGenBuffers(1, &wav->openal_buffer);
+	alBufferData(wav->openal_buffer, AL_FORMAT_MONO16, (channels > 1) ? audio : samples,
+				 samplecount * sizeof(short) / channels, samplerate);
+	if(channels > 1) free(audio);
+	wav->min = min;
+	wav->max = max;
+	return 0;
+#else
+	return -1;
+#endif
+}
+
 void sound_load(struct Sound_wav* wav, char* name, float min, float max) {
 #ifdef USE_SOUND
 	if(!sound_enabled)
@@ -242,6 +281,7 @@ void sound_load(struct Sound_wav* wav, char* name, float min, float max) {
 		log_fatal("Could not load sound %s", name);
 		exit(1);
 	}
+	log_debug("Loaded sound: %s (%ich, %iHz, %lu samples)", name, channels, samplerate, (unsigned long)samplecount);
 
 	short* audio;
 	if(channels > 1) { // convert stereo to mono
@@ -280,7 +320,7 @@ void sound_init() {
 		return;
 	}
 
-	alDistanceModel(AL_LINEAR_DISTANCE_CLAMPED);
+	alDistanceModel(AL_INVERSE_DISTANCE_CLAMPED);
 
 	sound_volume(settings.volume / 10.0F);
 
@@ -340,5 +380,7 @@ void sound_init() {
 
 	sound_load(&sound_zoomin, "wav/zoomin.wav", 0.1F, 1024.0F);
 	sound_load(&sound_zoomout, "wav/zoomout.wav", 0.1F, 1024.0F);
+
+	sound_load(&sound_screenshot, "wav/screenshot.wav", 0.1F, 1024.0F);
 #endif
 }
