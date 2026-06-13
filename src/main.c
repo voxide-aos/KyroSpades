@@ -18,6 +18,14 @@
 */
 
 #include <time.h>
+#include <sys/stat.h>
+#if defined(USE_SDL) && defined(__ANDROID__)
+#include <SDL_main.h>
+#endif
+#if defined(__ANDROID__)
+#include <unistd.h>   /* chdir */
+#include <SDL.h>      /* SDL_AndroidGet*StoragePath */
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -677,11 +685,20 @@ void display() {
 		mu_Context* ctx = hud_active->ctx;
 
 		if(ctx) {
-			hud_active->ctx->style->padding = settings.ui_padding;
-			hud_active->ctx->style->spacing = settings.ui_spacing;
-			hud_active->ctx->style->title_height = 24;
-			hud_active->ctx->style->scrollbar_size = 12;
-			hud_active->ctx->style->thumb_size = 8;
+			/* hud_ui_scale() enlarges touch targets so buttons and list rows
+			   aren't a few mm tall on phones. It returns 1.0 on non-Android
+			   builds, so desktop layout is unchanged. */
+			float us = hud_ui_scale();
+			/* Row HEIGHT for height==0 layout rows is style->size.y + padding*2,
+			   so scaling size.y AND padding is what enlarges nav/menu buttons and
+			   list rows. Base values match microui's default_style. */
+			hud_active->ctx->style->size.x = (int)(68 * us);
+			hud_active->ctx->style->size.y = (int)(10 * us);
+			hud_active->ctx->style->padding = (int)(5 * us);
+			hud_active->ctx->style->spacing = (int)(4 * us);
+			hud_active->ctx->style->title_height = (int)(24 * us);
+			hud_active->ctx->style->scrollbar_size = (int)(12 * us);
+			hud_active->ctx->style->thumb_size = (int)(8 * us);
 
 			mu_begin(ctx);
 		}
@@ -690,6 +707,7 @@ void display() {
 
 		if(ctx) {
 			mu_end(ctx);
+			hud_ime_update();
 
 			glEnable(GL_BLEND);
 			glEnable(GL_SCISSOR_TEST);
@@ -1076,7 +1094,11 @@ int main(int argc, char** argv) {
 	settings.player_arms = 0;
 	settings.fullscreen = 0;
 	settings.greedy_meshing = 0;
-	settings.mouse_sensitivity = MOUSE_SENSITIVITY;
+	/* The look formula is `setting / 5.0F * MOUSE_SENSITIVITY`, so the
+	   neutral value of this setting is 5 — NOT the raw radians/pixel
+	   constant MOUSE_SENSITIVITY (0.002), which would render the camera
+	   effectively frozen. */
+	settings.mouse_sensitivity = 5.0F;
 	settings.show_news = 1;
 	settings.show_fps = 0;
 	settings.volume = 10;
@@ -1106,18 +1128,30 @@ int main(int argc, char** argv) {
 	settings.chat_mention_g = 255;
 	strcpy(settings.name, "DEV_CLIENT");
 
-#ifdef USE_TOUCH
-	mkdir("/sdcard/KyroSpades");
-#else
+#if defined(__ANDROID__)
+	/* The process CWD on Android is "/" (read-only). Switch to the app's
+	   private external storage dir (writable, needs no permission, removed on
+	   uninstall) so every relative write path below resolves correctly. */
+	{
+		const char* base = SDL_AndroidGetExternalStoragePath();
+		if(!base || chdir(base) != 0) {
+			const char* internal = SDL_AndroidGetInternalStoragePath();
+			if(internal) chdir(internal);
+		}
+	}
+#endif
+	/* Create the writable subdirs on every platform. "demos" is included now —
+	   it was never created before, which is why the Demos screen failed. */
 	if(!file_dir_exists("logs"))
 		file_dir_create("logs");
+	if(!file_dir_exists("demos"))
+		file_dir_create("demos");
 	if(!file_dir_exists("cache"))
 		file_dir_create("cache");
 	if(!file_dir_exists("screenshots"))
 		file_dir_create("screenshots");
 	if(!file_dir_exists("vxl"))
 		file_dir_create("vxl");
-#endif
 
 	log_set_level(LOG_INFO);
 
