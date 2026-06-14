@@ -747,6 +747,17 @@ static int hud_ingame_onscreencontrol(int index, char* str, int activate) {
 						if(activate == 1)
 							window_pressed_keys[WINDOW_KEY_CROUCH] = 1;
 						return 1;
+					/* Spectator free-camera toggle (touch has no keyboard key
+					   for WINDOW_KEY_SWITCH_CAMERA). PRESS only; the handler
+					   toggles on PRESS. */
+					case 68:
+						if(camera_mode != CAMERAMODE_SPECTATOR)
+							return 0;
+						if(str)
+							strcpy(str, cameracontroller_bodyview_mode ? "FreeCam" : "Follow");
+						if(activate == 1)
+							hud_ingame_keyboard(WINDOW_KEY_SWITCH_CAMERA, WINDOW_PRESS, 0, 0);
+						return 1;
 				}
 			}
 		}
@@ -2087,11 +2098,16 @@ static void hud_ingame_render(mu_Context* ctx, float scalex, float scalef) {
 					float box_top = 585 * scalef;
 					float box_size = 128 * scalef;
 
+					/* Screen pixels per world unit for the current zoom: the box
+					   is fixed-size but shows a `viewport`-wide world slice, so
+					   the 512x512 texture is drawn at 512*ppw, camera-centred. */
+					float ppw = box_size / viewport;
+
 					glColor4f(1.0F, 1.0F, 1.0F, 1.0F);
 					glEnable(GL_SCISSOR_TEST);
 					glScissor((int)box_x, (int)(box_top - box_size), (int)ceil(box_size), (int)ceil(box_size));
-					texture_draw(&texture_minimap, box_x - (camera_x - 64.0F) * scalef,
-								 box_top + (camera_z - 64.0F) * scalef, 512 * scalef, 512 * scalef);
+					texture_draw(&texture_minimap, box_x - view_x * ppw,
+								 box_top + view_z * ppw, 512.0F * ppw, 512.0F * ppw);
 					glDisable(GL_SCISSOR_TEST);
 
 					int gl_err = glGetError();
@@ -2317,6 +2333,14 @@ texture_draw_empty_rotated(settings.window_width - 143 * scalef + tent2_x * map_
 							 settings.window_height * 0.45F, settings.window_height * 0.15F,
 							 settings.window_height * 0.1F, 0.0F);
 		font_centered(settings.window_width - settings.window_height * 0.075F, settings.window_height * 0.47F,
+					  settings.window_height * 0.04F, str);
+	}
+	/* Spectator free-camera toggle, under the LMB/RMB plates. */
+	if(hud_ingame_onscreencontrol(68, str, -1)) {
+		texture_draw_rotated(&texture_ui_input, settings.window_width - settings.window_height * 0.075F,
+							 settings.window_height * 0.3F, settings.window_height * 0.15F,
+							 settings.window_height * 0.1F, 0.0F);
+		font_centered(settings.window_width - settings.window_height * 0.075F, settings.window_height * 0.32F,
 					  settings.window_height * 0.04F, str);
 	}
 	/* Jump + Crouch side by side directly below the left joystick (the
@@ -3363,6 +3387,14 @@ static void hud_ingame_touch(void* finger, int action, float x, float y, float d
 							  settings.window_width - settings.window_height * 0.075F, settings.window_height * 0.45F,
 							  settings.window_height * 0.15F, settings.window_height * 0.1F)) {
 			hud_ingame_onscreencontrol(65, NULL, (action == TOUCH_DOWN) ? 1 : 0);
+			return;
+		}
+		/* Spectator free-camera toggle plate. */
+		if(hud_ingame_onscreencontrol(68, NULL, -1)
+		   && is_inside_centered(f->start.x, settings.window_height - f->start.y,
+								 settings.window_width - settings.window_height * 0.075F, settings.window_height * 0.3F,
+								 settings.window_height * 0.15F, settings.window_height * 0.1F)) {
+			hud_ingame_onscreencontrol(68, NULL, (action == TOUCH_DOWN) ? 1 : 0);
 			return;
 		}
 		/* Jump/Crouch plates below the joystick. Hit-testing keys off the
